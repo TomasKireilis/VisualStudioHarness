@@ -1,16 +1,28 @@
 const $ = selector => document.querySelector(selector);
-const token = $('meta[name="workbench-token"]').content;
+let token = $('meta[name="workbench-token"]').content;
+let reconnecting;
 let sessions = [], selected = localStorage.getItem('workbench.selected'), signature = '', busy = false;
 const viewedPhases = new Map();
 const phases = ['requirements', 'development', 'demo'];
 const working = s => ['setting_up', 'waiting_for_agent', 'agent_working', 'demo_pending', 'recording'].includes(s.status);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 const labels = { setting_up: 'Preparing environment', awaiting_brief: 'Ready for your idea', waiting_for_agent: 'Waiting for VS Code', agent_working: 'With the AI', awaiting_human: 'Your input needed', requirements_ready: 'Ready for review', bridge_error: 'Bridge needs attention', error: 'Setup needs attention', demo_pending: 'Preparing demo', recording: 'Recording demo', demo_failed: 'Demo needs attention', complete: 'Complete' };
-const guidance = { requirements: 'Describe the outcome you want. The AI will ask about anything that needs more detail. Review the requirements before development starts.', development: 'Follow progress in VS Code. If the AI needs a decision, its questions will appear here. Your approved requirements stay in the project folder.', demo: 'UI changes get a recorded walkthrough. The change report includes affected files, before and after code, and the checks reported by your AI.' };
+const guidance = { requirements: 'Describe the outcome you want. The AI will ask about anything that needs more detail. Review the requirements before development starts.', development: 'Follow AI progress in the activity history. If the AI needs a decision, its questions will appear here. Your approved requirements stay in the project folder.', demo: 'Review the recorded walkthrough and the AI summary of changes and checks.' };
 function toast(message) { $('#toast').textContent = message; $('#toast').hidden = false; setTimeout(() => $('#toast').hidden = true, 9000); }
-async function api(url, data, method) {
+async function api(url, data, method, retry = true) {
   const response = await fetch(url, { method: method || (data === undefined ? 'GET' : 'POST'), headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': token }, body: data === undefined ? undefined : JSON.stringify(data), signal: AbortSignal.timeout(url.endsWith('/rollback') ? 200000 : 15000) });
   const result = await response.json();
+  if (response.status === 401 && retry) {
+    reconnecting ||= fetch('/', { cache: 'no-store', signal: AbortSignal.timeout(8000) }).then(async response => {
+      if (!response.ok) throw new Error('Dashboard reconnection failed');
+      const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+      const next = page.querySelector('meta[name="workbench-token"]')?.content;
+      if (!next) throw new Error('Dashboard token unavailable');
+      token = next;
+    }).finally(() => { reconnecting = undefined; });
+    await reconnecting;
+    return api(url, data, method, false);
+  }
   if (!response.ok) throw new Error(result.error);
   return result;
 }
@@ -39,14 +51,19 @@ async function action(name, data = {}) {
   catch (error) { toast(error.message); }
   finally { busy = false; controls.forEach(b => b.disabled = false); render(); }
 }
+function messagePhase(s, message) {
+  const job = s.jobs.findLast(j => j.createdAt <= message.time);
+  return message.phase || (job?.kind === 'demo_review' ? 'demo' : job?.kind) || 'requirements';
+}
 function conversation(s) {
-  const messages = s.messages.filter(m => {
-    const job = s.jobs.findLast(j => j.createdAt <= m.time);
-    return (m.phase || (job?.kind === 'demo_review' ? 'demo' : job?.kind) || 'requirements') === s.phase;
-  });
+  const messages = s.messages.filter(m => messagePhase(s, m) === s.phase);
   return messages.length ? `<div class="conversation">${messages.map(m => `<div class="message ${m.role === 'human' ? 'human' : ''}"><strong>${m.role === 'human' ? 'You' : 'Your AI'}</strong>${esc(m.text)}${m.questions?.length ? `<ol>${m.questions.map(q => `<li>${esc(q)}</li>`).join('')}</ol>` : ''}</div>`).join('')}</div>` : '';
 }
 function errorBox(s) { return s.error ? `<div class="error-box" role="alert">${esc(s.error)}</div>` : ''; }
+function demoSummary(s) {
+  const messages = ['development', 'demo'].map(phase => s.messages.findLast(m => m.role === 'ai' && !m.questions?.length && messagePhase(s, m) === phase)).filter(Boolean);
+  return messages.length ? `<h3>AI summary</h3><div class="conversation">${messages.map(m => `<div class="message"><strong>${messagePhase(s, m) === 'demo' ? 'Demo review' : 'Development'}</strong>${esc(m.text)}</div>`).join('')}</div>` : '';
+}
 function content(s, viewedPhase = s.phase) {
   if (viewedPhase !== s.phase) {
     const previous = phases.indexOf(viewedPhase) < phases.indexOf(s.phase);
@@ -57,7 +74,7 @@ function content(s, viewedPhase = s.phase) {
   if (s.status === 'setting_up' || s.status === 'error') return `<div class="empty-state"><div class="empty-icon">⌘</div><h3>${s.status === 'error' ? 'Let’s get the environment ready' : 'Making room for your next idea'}</h3><p>A fresh project folder is ready. We’re preparing Playwright and Chromium for video recording. The installation log shows progress and any errors.</p></div>${errorBox(s)}<div class="actions">${s.status === 'error' ? '<button class="primary" data-action="setup">Retry environment setup</button>' : ''}<a class="secondary" target="_blank" href="${fileUrl(s, '.harness/setup.log')}">View installation log ↗</a></div>`;
   if (s.status === 'requirements_ready') return `${conversation(s)}${assessment(s)}<p>Review the requirements below. You can edit them before starting development.</p><label for="requirements">REQUIREMENTS.md</label><textarea id="requirements">${esc(s.requirements)}</textarea><div class="actions"><button class="primary" id="approve">Approve & start development ↗</button></div><details><summary>Ask for a revision</summary>${answerForm('Describe what should change…')}</details>`;
   if (s.status === 'awaiting_human') return `${conversation(s)}<p>Your AI needs a little direction before continuing.</p>${questionForm(s.questions || [])}`;
-  if (s.phase === 'demo' && !['waiting_for_agent', 'agent_working', 'bridge_error'].includes(s.status)) return `<div class="empty-state"><div class="empty-icon">${working(s) ? '<span class="spinner" aria-label="Working"></span>' : s.status === 'complete' ? '✓' : '▷'}</div><h3>${s.status === 'complete' ? 'Your work is ready to review' : s.status === 'demo_failed' ? 'The walkthrough needs attention' : 'Capturing your solution in action'}</h3><p>${s.uiChanged ? 'Review the recorded UI walkthrough and the source change report.' : 'Your backend change report includes impact notes, captured code changes and reported validation.'}</p></div>${errorBox(s)}${conversation(s)}${['complete', 'demo_failed'].includes(s.status) ? '<div class="actions"><button class="secondary" data-action="review-demo">Ask AI to review demo</button></div>' : ''}${s.artifacts.filter(f => f.endsWith('/walkthrough.webm')).slice(-1).map(f => `<video controls preload="metadata" src="${fileUrl(s, f)}" aria-label="Recorded application walkthrough"></video>`).join('')}<div class="artifacts">${s.artifacts.map(f => `<a class="artifact" href="${fileUrl(s, f)}" target="_blank" rel="noopener">${esc(f.replace('artifacts/', ''))}<span>↗</span></a>`).join('')}</div>${s.artifacts.includes('artifacts/impact.md') ? '<details><summary>Read the change report</summary><pre class="report" id="report">Loading report…</pre></details>' : ''}${['complete', 'demo_failed'].includes(s.status) && s.uiChanged ? '<div class="actions"><button class="secondary" data-action="demo">Record demo again</button></div>' : ''}`;
+  if (s.phase === 'demo' && !['waiting_for_agent', 'agent_working', 'bridge_error'].includes(s.status)) return `<div class="empty-state"><div class="empty-icon">${working(s) ? '<span class="spinner" aria-label="Working"></span>' : s.status === 'complete' ? '✓' : '▷'}</div><h3>${s.status === 'complete' ? 'Your work is ready to review' : s.status === 'demo_failed' ? 'The walkthrough needs attention' : 'Capturing your solution in action'}</h3><p>${s.uiChanged ? 'Review the recorded walkthrough and the AI summary.' : 'Review the AI summary of the backend changes and validation.'}</p></div>${errorBox(s)}${demoSummary(s)}${['complete', 'demo_failed'].includes(s.status) ? '<div class="actions"><button class="secondary" data-action="review-demo">Ask AI to review demo</button></div>' : ''}${s.artifacts.filter(f => f.endsWith('/walkthrough.webm')).slice(-1).map(f => `<video controls preload="metadata" src="${fileUrl(s, f)}" aria-label="Recorded application walkthrough"></video>`).join('')}${['complete', 'demo_failed'].includes(s.status) && s.uiChanged ? '<div class="actions"><button class="secondary" data-action="demo">Record demo again</button></div>' : ''}`;
   return `${conversation(s)}<div class="empty-state"><div class="empty-icon">${working(s) ? '<span class="spinner" aria-label="Working"></span>' : '✧'}</div><h3>${s.status === 'waiting_for_agent' ? 'Ready to connect with your AI' : s.status === 'bridge_error' ? 'The chat bridge needs attention' : 'Your AI has the next step'}</h3><p>${s.status === 'waiting_for_agent' ? 'Open this workspace in VS Code, trust the folder and sign in to Copilot. The bridge will pick up the request.' : 'Follow the work in VS Code. If automatic submission is off, press Send in the prepared Copilot chat. Questions and results will arrive here.'}</p></div>${errorBox(s)}<div class="actions"><button class="secondary" data-action="open">Open VS Code ↗</button>${s.jobs.some(j => j.status === 'dispatched') ? '<button class="secondary" id="retry-job">Retry interrupted request</button>' : ''}</div><details><summary>View the current prompt</summary><pre class="report">${esc(s.jobs.at(-1)?.prompt || '')}</pre></details>`;
 }
 function assessment(s) {
@@ -89,10 +106,10 @@ function render() {
   $('#auto-submit').textContent = `Automatic chat: ${s.autoSubmit !== false ? 'On' : 'Off'}`;
   $('#auto-submit').setAttribute('aria-pressed', String(s.autoSubmit !== false));
   $('#auto-submit').onclick = () => action('auto-submit', { enabled: s.autoSubmit === false });
-  $('#current-activity').textContent = s.activity?.latest?.text ? `Latest activity: ${s.activity.latest.text.slice(0, 500)}` : '';
+  $('#current-activity').textContent = s.activity?.stale ? `No progress reported for over 90 seconds.${s.connected ? ' Check the Copilot chat for a pause, approval or missing reply.' : ' VS Code bridge is disconnected; open the workspace to reconnect.'}` : '';
   const history = s.activity?.summaries || [];
-  $('#summary-status').textContent = s.activity?.error ? `Summary unavailable: ${s.activity.error}` : `${labels[s.status] || s.status}. ${history.length ? 'Previous summaries are kept below. New summaries arrive during work.' : 'In VS Code, run “AI Workbench: Enable Activity Summaries” to start live summaries.'}`;
-  const historyHtml = history.slice().reverse().map(e => `<li><strong>${esc(e.phase)}${e.final ? ' · finished' : ''}</strong><br>${esc(e.text)}<time>${new Date(e.time).toLocaleString()}</time></li>`).join('');
+  $('#summary-status').textContent = s.activity?.error ? `Summary unavailable: ${s.activity.error}` : `${labels[s.status] || s.status}. Only changes are saved; checked every 30 seconds.`;
+  const historyHtml = history.slice().reverse().map(e => `<li><strong><span class="risk-grade risk-${esc(e.risk?.grade || 'A')}" title="${esc((e.risk?.reasons || []).join('; '))}">Risk ${esc(e.risk?.grade || 'A')}</span> ${esc(e.phase)}${e.final ? ' · finished' : ''}</strong><br>${esc(e.text)}<time>${new Date(e.time).toLocaleString()}</time></li>`).join('');
   if ($('#summaries').innerHTML !== historyHtml) $('#summaries').innerHTML = historyHtml;
   $('#breadcrumb').textContent = s.title;
   $('#folder-name').textContent = s.id;
@@ -120,7 +137,7 @@ function render() {
   $('#rollback-controls').innerHTML = ['development', 'demo'].includes(s.phase) ? `<details><summary>Return to previous step</summary><form id="rollback-form"><p>Reopen ${returnPhase} with your feedback. Current files and review history are kept.${s.status === 'recording' ? ' The return will wait for recording to finish.' : ''}</p><label for="rollback-reason">Bug or question to resolve</label><textarea id="rollback-reason" required maxlength="100000"></textarea>${s.jobs.some(j => j.status === 'dispatched') ? '<label><input id="agent-stopped" type="checkbox" required> I stopped the active Copilot request in VS Code</label>' : ''}<button class="secondary">Return & continue</button></form></details>` : '';
   $('#rollback-form')?.addEventListener('submit', e => { e.preventDefault(); action('rollback', { phase: returnPhase, reason: $('#rollback-reason').value, stopped: $('#agent-stopped')?.checked || false }); });
   $('#workspace-content').innerHTML = content(s, viewedPhase);
-  if ($('#report')) fetch(fileUrl(s, 'artifacts/impact.md')).then(r => r.text()).then(text => { if ($('#report') && selected === s.id) $('#report').textContent = text; }).catch(() => {});
+
   $('#brief-form')?.addEventListener('submit', e => { e.preventDefault(); action('brief', { text: $('#brief').value }); });
   $('#question-form')?.addEventListener('submit', e => {
     e.preventDefault();

@@ -64,13 +64,14 @@ test('guided requirements, development, real Playwright video and artifact revie
   await expect(page.locator('.activity-panel')).toBeVisible();
   await page.locator('[data-phase="development"]').click();
 
-  const summary = await app.workbench.activity.claim(s);
-  await app.workbench.activity.response(s, { id: summary.id, text: 'Building project creation and checking validation.' });
+  await app.workbench.progress(s.id, { jobId: job.id, text: 'Building project creation and checking validation.' });
+  app.workbench.activity.state(s).runs.at(-1).due = 0;
   await expect(page.locator('#summaries')).toContainText('Building project creation');
-  const nextSummary = await app.workbench.activity.claim(s, Date.now() + 61000);
-  await app.workbench.activity.response(s, { id: nextSummary.id, text: 'Checking the finished project form.' });
+  await app.workbench.progress(s.id, { jobId: job.id, text: 'Checking the finished project form.' });
+  app.workbench.activity.state(s).runs.at(-1).due = 0;
   await expect(page.locator('#summaries')).toContainText('Checking the finished');
   await expect(page.locator('#summaries')).toContainText('Building project creation');
+  await expect(page.locator('#summaries .risk-grade').first()).toContainText('Risk A');
   await page.reload();
   await expect(page.locator('#summaries')).toContainText('Building project creation');
 
@@ -95,9 +96,11 @@ test('guided requirements, development, real Playwright video and artifact revie
   await expect.poll(() => video.evaluate(el => el.readyState)).toBeGreaterThan(0);
   const videoFile = s.artifacts.find(f => f.endsWith('walkthrough.webm'));
   expect((await fs.stat(path.join(s.folder, videoFile))).size).toBeGreaterThan(1000);
-  await page.getByText('Read the change report', { exact: true }).click();
-  await expect(page.locator('#report')).toContainText('Local project tracker demo');
-  await expect(page.locator('#report')).toContainText('app.cjs');
+  await expect(page.getByRole('heading', { name: 'AI summary', exact: true })).toBeVisible();
+  await expect(page.locator('#workspace-content')).toContainText('Project creation implemented.');
+  await expect(page.locator('.artifact')).toHaveCount(0);
+  await expect(page.getByText('Read the change report', { exact: true })).toHaveCount(0);
+  expect((await fs.readFile(path.join(s.folder, 'artifacts/impact.md'), 'utf8'))).toContain('Local project tracker demo');
   await page.screenshot({ path: '.local/dashboard-complete.png', fullPage: true });
   const range = await fetch(`${app.url}/api/sessions/${s.id}/file?path=${encodeURIComponent(videoFile)}`, { headers: { 'X-Workbench-Token': app.uiToken, Range: 'bytes=0-99' } });
   expect(range.status).toBe(206); expect((await range.arrayBuffer()).byteLength).toBe(100);
@@ -109,10 +112,33 @@ test('guided requirements, development, real Playwright video and artifact revie
   expect(errors).toEqual([]);
 });
 function assertJob(job) { expect(job.kind).toBe('development'); }
+
+test('dashboard renews expired tokens and preserves the form draft', async ({ page }) => {
+  await page.route(`${app.url}/`, async route => {
+    const response = await route.fetch();
+    await route.fulfill({ response, body: (await response.text()).replace(app.uiToken, 'expired-token') });
+    await page.unroute(`${app.url}/`);
+  });
+  await page.goto(app.url);
+  await page.getByRole('button', { name: 'New workspace' }).click();
+  await expect(page.getByRole('button', { name: 'New workspace' })).toBeEnabled();
+  await page.getByLabel('Describe your project').fill('Retain this draft after reconnecting');
+  let rejected = false;
+  await page.route(`${app.url}/api/sessions`, async route => {
+    if (!rejected && route.request().method() === 'GET') {
+      rejected = true;
+      await route.fulfill({ status: 401, json: { error: 'Refresh the dashboard to reconnect' } });
+    } else await route.continue();
+  });
+  await expect.poll(() => rejected).toBe(true);
+  await expect(page.getByLabel('Describe your project')).toHaveValue('Retain this draft after reconnecting');
+  await expect(page.locator('#updated')).not.toContainText('Server unavailable');
+});
 test('mobile layout remains usable and form drafts survive polling', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(app.url);
   await page.getByRole('button', { name: 'New workspace' }).click();
+  await expect(page.getByRole('button', { name: 'New workspace' })).toBeEnabled();
   await page.getByLabel('Describe your project').fill('Keep my draft while the dashboard refreshes');
   await page.waitForTimeout(2500);
   await expect(page.getByLabel('Describe your project')).toHaveValue('Keep my draft while the dashboard refreshes');

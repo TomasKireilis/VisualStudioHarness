@@ -195,6 +195,34 @@ test('activity summaries use 30 second cadence, enforce 50 words, finish and per
   const restarted = new Workbench({ root: w.root, url: w.url }); await restarted.load();
   assert.equal(restarted.public(restarted.get(id)).activity.summaries.length, 3);
 });
+test('automatic history uses reported progress every 30 seconds and records the final AI reply', async () => {
+  const { w, id } = await fixture();
+  await w.brief(id, 'Feature'); const job = await w.claim(id), s = w.get(id);
+  const start = Date.now();
+  await w.progress(id, { jobId: job.id, text: 'Read api.js and checking validation.' });
+  w.activity.modelLeases.set(id, start);
+  await w.activity.automatic(s, start - 1);
+  assert.equal(w.activity.view(s).summaries.length, 0);
+  // Automatic notes resume as soon as the optional model bridge stops polling.
+  await w.activity.automatic(s, start);
+  assert.equal(w.activity.view(s).summaries.length, 1);
+  assert.equal(w.activity.view(s).summaries[0].source, 'reported');
+  assert.match(w.activity.view(s).summaries[0].text, /checking validation/);
+  await w.activity.automatic(s, start + 29999);
+  assert.equal(w.activity.view(s).summaries.length, 1);
+  await w.activity.automatic(s, start + 30000);
+  assert.equal(w.activity.view(s).summaries.length, 1);
+  await w.response(id, { jobId: job.id, kind: 'questions', message: 'Need a decision on roles.', questions: ['Which role?'] });
+  await w.activity.automatic(s, start + 30001);
+  const final = w.activity.view(s).summaries.at(-1);
+  assert.equal(final.final, true);
+  assert.equal(final.text, 'Need a decision on roles.');
+  await w.activity.automatic(s, start + 60000);
+  assert.equal(w.activity.view(s).summaries.length, 2);
+  const restarted = new Workbench({ root: w.root, url: w.url }); await restarted.load();
+  assert.equal(restarted.public(restarted.get(id)).activity.summaries.length, 2);
+});
+
 test('summary errors retry and expired replies are ignored without blocking workflow', async () => {
   const { w, id } = await fixture(); await w.brief(id, 'Feature'); await w.claim(id);
   const s = w.get(id), first = await w.activity.claim(s, 100000);

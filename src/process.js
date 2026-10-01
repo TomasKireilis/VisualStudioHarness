@@ -35,6 +35,21 @@ export async function npmCli() {
   return found;
 }
 
+export async function prepareCodeArgs(folder, extensionPath) {
+  const { cp } = await import('node:fs/promises');
+  const { join, resolve } = await import('node:path');
+  const workspace = resolve(folder);
+  const args = ['--new-window'];
+  if (extensionPath) {
+    // VS Code reloads an existing development host for the same extension path,
+    // even with --new-window. A workspace-specific copy gives each its own host.
+    const bridgePath = join(workspace, '.harness', 'bridge-extension');
+    await cp(extensionPath, bridgePath, { recursive: true, force: true });
+    args.push(`--extensionDevelopmentPath=${bridgePath}`);
+  }
+  return [...args, workspace];
+}
+
 export async function openCode(folder, extensionPath) {
   const { existsSync } = await import('node:fs');
   const { readFile } = await import('node:fs/promises');
@@ -57,5 +72,5 @@ export async function openCode(folder, extensionPath) {
   // A server started from an extension host inherits its entry point and IPC
   // settings. The desktop launcher must start with its own environment.
   for (const key of Object.keys(env)) if (key.startsWith('VSCODE_')) delete env[key];
-  await run(executable, [cli, '--new-window', ...(extensionPath ? [`--extensionDevelopmentPath=${extensionPath}`] : []), folder], { timeout: 30000, env });
+  await run(executable, [cli, ...await prepareCodeArgs(folder, extensionPath)], { timeout: 30000, env });
 }

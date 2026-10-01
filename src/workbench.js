@@ -58,6 +58,7 @@ export class Workbench {
       this.activity.writes.delete(id);
       this.sessions.delete(id);
       this.activity.states.delete(id);
+      this.activity.modelLeases.delete(id);
       return { deleted: id };
     });
   }

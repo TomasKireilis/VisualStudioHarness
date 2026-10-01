@@ -39,7 +39,11 @@ export async function startServer({ port = 4310, root = 'C:/AIWork', autoOpen = 
         const session = workbench.get(parts[1]);
         if (req.headers.authorization !== `Bearer ${session.token}`) return send(res, 401, { error: 'Invalid bridge token' });
         if (req.method === 'POST' && parts[2] === 'progress') { await workbench.progress(session.id, await body(req)); return send(res, 200, { ok: true }); }
-        if (req.method === 'POST' && parts[2] === 'summary-claim') return send(res, 200, { job: await workbench.activity.claim(session) });
+        if (req.method === 'POST' && parts[2] === 'summary-claim') {
+          // A model-enabled bridge polls every two seconds. Prefer it while it is online.
+          workbench.activity.modelLeases.set(session.id, Date.now() + 5000);
+          return send(res, 200, { job: await workbench.activity.claim(session) });
+        }
         if (req.method === 'POST' && parts[2] === 'summary-response') { await workbench.activity.response(session, await body(req)); return send(res, 200, { ok: true }); }
         if (req.method === 'POST' && parts[2] === 'claim') return send(res, 200, { job: await workbench.claim(session.id) });
         if (req.method === 'POST' && parts[2] === 'response') return send(res, 200, await workbench.response(session.id, await body(req)));
