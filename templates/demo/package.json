@@ -1,0 +1,7 @@
+{
+  "name": "workspace-demo",
+  "private": true,
+  "type": "module",
+  "scripts": { "demo": "node record.mjs" },
+  "devDependencies": { "@playwright/test": "1.58.2" }
+}

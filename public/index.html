@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="workbench-token" content="__TOKEN__">
+  <title>AI Workbench · Build with a little guidance</title>
+  <link rel="stylesheet" href="/style.css"><script type="module" src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-icon">w<span>·</span></span><span>workbench<small>LOCAL AI STUDIO</small></span></a>
+    <button class="new-project" id="new-project"><span>＋</span> New workspace</button>
+    <div class="nav-label">YOUR WORKSPACES <span id="workspace-count">0</span></div>
+    <nav id="workspaces" aria-label="Workspaces"></nav>
+    <div class="sidebar-foot"><span class="live-dot"></span> Running on your computer<small>Windows · VS Code · Copilot</small></div>
+  </aside>
+  <main>
+    <header class="topbar"><div><span class="crumb">Workspace</span><span class="slash">/</span><span id="breadcrumb">Getting started</span></div><span class="local-badge">↳ Local environment</span></header>
+    <div id="toast" role="alert" hidden></div>
+    <div class="page-heading"><div><div class="eyebrow">FROM AN IDEA TO SOMETHING REAL</div><h1>Let’s build it, together.</h1><p>You bring the direction. Your AI handles the development.</p></div><button class="secondary" id="open-code">↗ Open VS Code</button></div>
+    <section class="steps" aria-label="Project stages">
+      <button class="step" data-phase="requirements"><span class="step-number">01</span><span><strong>Define the work</strong><small>Gather & approve requirements</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="development"><span class="step-number">02</span><span><strong>Build the solution</strong><small>Your AI gets to work</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="demo"><span class="step-number">03</span><span><strong>See the result</strong><small>Watch, review & explore</small></span><span class="step-mark"></span></button>
+    </section>
+    <div class="content-grid">
+      <section class="panel primary-panel">
+        <div class="panel-heading"><div><span class="section-label" id="phase-label">STEP 01 / REQUIREMENTS</span><h2 id="panel-title">Start with your idea</h2></div><span id="status" class="pill">Preparing</span></div>
+        <div class="actions"><button class="secondary" id="auto-submit" aria-pressed="true">Automatic chat: On</button></div><div id="rollback-controls"></div><div id="workspace-content"></div>
+      </section>
+      <aside class="details">
+        <section class="panel environment"><div class="mini-title">YOUR ENVIRONMENT <span class="tiny-icon">⌘</span></div><div class="env-name"><span class="folder-icon">▱</span><div><strong id="folder-name">New workspace</strong><small>Isolated project folder</small></div></div><code id="folder-path">Preparing workspace…</code><div class="env-row"><span>VS Code bridge</span><span id="bridge-status">Waiting</span></div><div class="env-row"><span>Playwright + Chromium</span><span id="playwright-status">Preparing</span></div><div class="env-row"><span>Response channel</span><span>Workspace files</span></div></section>
+        <section class="panel guidance"><div class="mini-title">A LITTLE GUIDANCE <span>✧</span></div><p id="guidance-text">Describe the outcome you want. The AI will ask about anything that needs more detail.</p><div class="guide-note">You’re in the loop when it matters.</div></section>
+        <section class="panel activity"><div class="mini-title">WORKSPACE ACTIVITY <span class="live-dot"></span></div><ol id="activity"></ol></section>
+      </aside>
+    </div>
+    <footer><span>Built locally. Guided by you.</span><span id="updated">Connecting to workbench…</span></footer>
+  </main>
+  <aside class="activity-panel activity" aria-label="AI activity history"><section><div class="mini-title">AI ACTIVITY HISTORY <span class="live-dot"></span></div><p id="summary-status" role="status"></p><p id="current-activity" aria-live="polite"></p><ol id="summaries" aria-live="polite"></ol></section></aside>
+</body>
+</html>

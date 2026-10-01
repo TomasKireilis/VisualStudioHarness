@@ -1,0 +1,9 @@
+{
+  "url": "http://127.0.0.1:3000",
+  "start": null,
+  "steps": [
+    { "action": "goto", "path": "/" },
+    { "action": "expect", "selector": "body" },
+    { "action": "screenshot", "name": "application" }
+  ]
+}

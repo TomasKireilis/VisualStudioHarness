@@ -1,0 +1,28 @@
+export function makePrompt(session, job) {
+  const schema = {
+    jobId: job.id,
+    kind: job.kind === 'demo_review' ? 'demo_review_complete' : job.kind === 'requirements' ? 'questions' : 'development_complete',
+    message: 'Human-readable progress or completion summary',
+    questions: ['A question for the human, when clarification is needed'],
+    requirements: 'Full requirements in Markdown when ready',
+    assessment: { feasible: true, evidence: 'Files inspected and checks performed, results and remaining risks', steps: ['Short ordered implementation step'], technologies: ['Technology and why it fits'], codeImpact: ['Existing files/interfaces/data affected, compatibility and migration impact; or new project'] },
+    uiChanged: false,
+    impact: [{ file: 'src/example.js', description: 'What changed and why' }],
+    tests: ['Commands run and actual results; clearly identify anything not run']
+  };
+  return `You are working in a Windows workspace managed by AI Workbench.
+Use VS Code local agent tools to work in this folder. Never use Copilot CLI.
+For browser feasibility run node .harness/demo/check.mjs from the workspace root. It loads the saved browser cache from .harness/demo/runtime.json before importing Playwright. A plain Playwright import in an old terminal may use a different cache; do not infer a missing browser from that alone. New VS Code terminals also receive the configured cache.
+Read REQUIREMENTS.md and .harness/conversation.json for the complete brief and human answers.
+Current phase: ${job.kind}. Job ID: ${job.id}.
+${job.kind === 'demo_review' ? 'Review the latest artifacts (screenshots, demo result JSON, logs and impact reports) and compare with REQUIREMENTS.md. Do not claim you watched a video unless a tool actually supports it. Do not edit source files in this phase. If bugs or unresolved implementation questions are found, return kind="rollback" with a concise message describing evidence and required fixes; this reopens development. If human input is needed return questions. Otherwise return kind="demo_review_complete" with a short message stating what was checked and any limitations.' : job.kind === 'requirements'
+    ? 'Persist until requirements are complete and demonstrably feasible. Inspect the existing code, dependencies and runtime before proposing a solution. Verify feature feasibility with relevant read-only checks or small disposable probes. Document actual evidence, risks and unknowns; do not invent verification. Ask focused follow-up questions in batches until material ambiguities and blockers are resolved. Do not ask again about decisions already answered in the conversation. If infeasible, explain the blocker and ask about achievable alternatives; never mark it ready. Provide short bullet points for ordered implementation steps, technologies with reasons, and impact on existing code, interfaces, data, compatibility and tests (explicitly state if this is a new project). Include these in both REQUIREMENTS.md and the structured assessment field. Do not develop yet. When sufficiently clear, return kind="requirements_ready" and the full Markdown requirements, including acceptance criteria, scope, constraints, and assumptions.'
+    : 'Implement the approved REQUIREMENTS.md. Work autonomously within its scope. You may ask the human questions using kind="questions". Run relevant validation and report real outcomes. On completion use kind="development_complete". Describe backend impact in impact[] and tests[]. Set uiChanged=true if any visible UI changed. If UI changed, configure .harness/demo/config.json with the local app URL, a command and args to start the app (or null if already running), and meaningful demo steps. Playwright is already installed in .harness/demo: do not install it. Demo steps support goto(path), click(selector), fill(selector,value), expect(selector,text optional), screenshot(name), and wait(milliseconds). Use browser selectors for your app. Do not execute the demo; the server does that.'}
+Throughout work, update .harness/progress/${job.id}.json with {"jobId":"${job.id}","text":"Concise progress: files read and findings, decisions and brief rationale, tool outcomes, current action and next step"}. Write an initial note and update after meaningful actions, roughly every 30 seconds while working. Only report observable work and concise decision summaries, never private chain-of-thought or secrets. The server collects these notes for a separate summarizer.
+If a development task reveals requirements need correction, return kind="rollback" with message explaining the issue as your last action; the harness reopens requirements for human approval. Do not keep editing after this response. Review prior demo failures and human feedback in the conversation when repairing a feature.
+Respond to the harness by writing valid JSON to .harness/responses/${job.id}.json as your LAST action. This is the reply channel; a chat-only response cannot advance the workflow. Do not change session.json, bridge.json, jobs, or server credentials. The reply schema is:
+${JSON.stringify(schema, null, 2)}
+Only include applicable fields. For questions, kind="questions", questions must be nonempty. For requirements_ready include requirements, assessment (feasible=true, nonempty evidence, steps[], technologies[], codeImpact[]) and no questions. For development_complete include message, uiChanged, impact, tests. Use this exact jobId. Never claim work or tests were completed unless they were.
+Human brief: ${session.brief}
+`;
+}

@@ -1,0 +1,56 @@
+{
+  "name": "ai-workbench-bridge",
+  "displayName": "AI Workbench Bridge",
+  "description": "Connects a local Windows AI Workbench to VS Code Copilot chat.",
+  "version": "0.1.0",
+  "publisher": "local-workbench",
+  "engines": {
+    "vscode": "^1.109.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.cjs",
+  "activationEvents": [
+    "workspaceContains:.harness/bridge.json",
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Shows connection guidance only. Copilot prompts and server connections require workspace trust."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiWorkbench.openDashboard",
+        "title": "AI Workbench: Open Dashboard"
+      },
+      {
+        "command": "aiWorkbench.connect",
+        "title": "AI Workbench: Connect Workspace"
+      },
+      {
+        "command": "aiWorkbench.sendPending",
+        "title": "AI Workbench: Send Pending Prompt"
+      },
+      {
+        "command": "aiWorkbench.enableSummaries",
+        "title": "AI Workbench: Enable Activity Summaries"
+      }
+    ],
+    "configuration": {
+      "title": "AI Workbench",
+      "properties": {
+        "aiWorkbench.autoSubmit": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Automatically submit queued requests to local Copilot Agent chat. Enable only if permitted by your organization. VS Code tool approval settings still apply."
+        }
+      }
+    }
+  }
+}
