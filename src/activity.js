@@ -91,7 +91,7 @@ export class ActivityService {
       const previous = run.snapshot || run.pending.previousSummary;
       const delta = summaryDelta(previous, text);
       const risk = run.pending.risk || assessRisk(state.records.filter(r => r.runId === run.id));
-      const riskChanged = risk.grade !== (run.riskGrade || 'A');
+      const riskChanged = risk.grade !== (run.riskGrade || 'A') || JSON.stringify(risk.detections || []) !== JSON.stringify(run.lastRisk?.detections || []);
       if (delta || run.pending.final || riskChanged) {
         state.summaries.push({ time: new Date(time).toISOString(), phase: run.phase, runId: run.id, text: delta || (run.pending.final ? 'Step finished.' : 'Reported risk changed.'), snapshot: text, risk, final: run.pending.final, source: input.source === 'reported' ? 'reported' : 'model' });
       }
@@ -112,12 +112,20 @@ export class ActivityService {
     const latest = state.records.findLast(r => ['progress', 'event'].includes(r.type));
     const summaries = [];
     const previous = new Map();
+    const previousTime = new Map();
     for (const entry of state.summaries) {
       const snapshot = entry.snapshot || entry.text;
       const text = entry.snapshot ? entry.text : summaryDelta(previous.get(entry.runId), snapshot);
       previous.set(entry.runId, snapshot);
+      const records = state.records.filter(r => r.runId === entry.runId && Date.parse(r.time) <= Date.parse(entry.time) && Date.parse(r.time) > (previousTime.get(entry.runId) || 0));
+      previousTime.set(entry.runId, Date.parse(entry.time));
       if (!text && !entry.final) continue;
-      summaries.push({ ...entry, text: text || 'Step finished.', risk: entry.risk?.version === riskVersion ? entry.risk : assessRisk([{ type: 'progress', text: snapshot }]) });
+      let risk = entry.risk;
+      if (risk?.version === 3) {
+        // Keep valid historical grades; tool evidence may have aged out of the raw log.
+        risk = { ...risk, detections: assessRisk(records.length ? records : [{ type: 'progress', text: snapshot }]).detections, version: riskVersion };
+      } else if (risk?.version !== riskVersion) risk = assessRisk([{ type: 'progress', text: snapshot }]);
+      summaries.push({ ...entry, text: text || 'Step finished.', risk });
     }
     return { summaries, error: state.error, active, latest, stale: active && (!latest || Date.now() - Date.parse(latest.time) > 90000) };
   }

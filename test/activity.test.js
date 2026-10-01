@@ -30,6 +30,32 @@ test('deltas omit identical notes and unchanged sentences', () => {
   assert.equal(summaryDelta('Read app.js.', 'No new progress reported. Latest update: Read app.js.'), '');
 });
 
+test('C through F include concrete reported evidence, with all detected classes retained', () => {
+  const evidence = ['POST /items returned 201', 'Installed a global dependency', 'Performed privilege escalation', 'Deleted backups'];
+  const risk = assessRisk(evidence.map(text => ({ type: 'tool', text })));
+  assert.equal(risk.grade, 'F');
+  assert.deepEqual(risk.detections.map(d => d.grade), ['C', 'D', 'E', 'F']);
+  assert.deepEqual(risk.detections.map(d => d.evidence), evidence);
+  assert.ok(risk.detections.every(d => d.reason));
+  assert.deepEqual(assessRisk([{ type: 'progress', text: 'Did not disable security controls' }]).detections, []);
+  assert.deepEqual(assessRisk([{ type: 'prompt', text: 'Deleted backups' }]).detections, []);
+});
+
+test('new evidence at the same grade is saved even when the summary is unchanged', async () => {
+  const activity = new ActivityService(); activity.save = async () => {};
+  const s = { id: 'evidence', phase: 'development' };
+  activity.start(s, 'job');
+  activity.record(s, 'progress', 'Checking the service.');
+  activity.record(s, 'tool', 'POST /items returned 201');
+  await activity.automatic(s, 100000);
+  activity.record(s, 'tool', 'DELETE /items/1 returned 204');
+  await activity.automatic(s, 130000);
+  const summaries = activity.view(s).summaries;
+  assert.equal(summaries.length, 2);
+  assert.equal(summaries[1].risk.grade, 'C');
+  assert.equal(summaries[1].risk.detections[0].evidence, 'DELETE /items/1 returned 204');
+});
+
 test('history skips idle notes, preserves risk, records changed snapshots and marks stale progress', async () => {
   const activity = new ActivityService(); activity.save = async () => {};
   const session = { id: 'test', phase: 'development', status: 'agent_working' };
@@ -63,4 +89,17 @@ test('outdated grades are recalculated for scope restrictions', () => {
   const activity = new ActivityService(), s = { id: 'old-risk' };
   activity.state(s).summaries = [{ runId: 'job', text: 'Reviewing artifacts; source edits are out of scope.', risk: { grade: 'D', version: 2 } }];
   assert.equal(activity.view(s).summaries[0].risk.grade, 'A');
+});
+
+test('version 3 history keeps its grade and recovers retained tool evidence', () => {
+  const activity = new ActivityService(), s = { id: 'historical' };
+  const state = activity.state(s);
+  state.records = [{ runId: 'job', time: new Date(1000).toISOString(), type: 'tool', text: 'POST /items returned 201' }];
+  state.summaries = [{ runId: 'job', time: new Date(2000).toISOString(), text: 'Checked the service.', risk: { grade: 'C', version: 3, reasons: ['Endpoint call reported'] } }];
+  const risk = activity.view(s).summaries[0].risk;
+  assert.equal(risk.grade, 'C');
+  assert.equal(risk.detections[0].evidence, 'POST /items returned 201');
+  state.records = [];
+  assert.equal(activity.view(s).summaries[0].risk.grade, 'C');
+  assert.deepEqual(activity.view(s).summaries[0].risk.detections, []);
 });

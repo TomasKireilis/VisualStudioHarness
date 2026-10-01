@@ -2,9 +2,11 @@ import { test, expect } from '@playwright/test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
+import http from 'node:http';
 import { startServer } from '../../src/server.js';
 import { json } from '../../src/files.js';
 import { run } from '../../src/process.js';
+import { assessRisk } from '../../src/activity-risk.js';
 
 let app, root;
 test.beforeAll(async () => {
@@ -113,6 +115,49 @@ test('guided requirements, development, real Playwright video and artifact revie
 });
 function assertJob(job) { expect(job.kind).toBe('development'); }
 
+test('recorder sends focused repeated keyboard inputs and keeps a readable recording', async () => {
+  const workspace = await app.workbench.create(); await app.workbench.locks.get(workspace.id);
+  const html = `<!doctype html><canvas tabindex="0"></canvas><p id="state">Ready</p><script>
+    let count = 0, releases = 0, previous = 0;
+    const canvas = document.querySelector('canvas');
+    canvas.addEventListener('keydown', event => {
+      if (event.code !== 'Space' || !event.isTrusted || (previous && performance.now() - previous < 80)) return;
+      previous = performance.now(); count++;
+      canvas.getContext('2d').fillRect(count * 20, 20, 10, 10);
+    });
+    canvas.addEventListener('keyup', event => {
+      if (event.code === 'Space' && event.isTrusted) releases++;
+      document.querySelector('#state').textContent = 'Flaps: ' + count + ', releases: ' + releases;
+    });
+  </script>`;
+  const server = http.createServer((req, res) => { res.setHeader('Content-Type', 'text/html'); res.end(html); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const dir = path.join(workspace.folder, '.harness/demo');
+    const config = { url: `http://127.0.0.1:${server.address().port}`, start: null, steps: [
+      { action: 'goto' }, { action: 'screenshot', name: 'ready' },
+      { action: 'click', selector: 'canvas', position: { x: 10, y: 10 } },
+      { action: 'press', selector: 'canvas', key: 'Space', repeat: 4, intervalMs: 120 },
+      { action: 'expect', selector: '#state', text: 'Flaps: 4, releases: 4' },
+      { action: 'screenshot', name: 'playing' }
+    ] };
+    await json(path.join(dir, 'config.json'), config);
+    // A retry upgrades the recorder in an existing workspace without replacing its steps.
+    await fs.writeFile(path.join(dir, 'record.mjs'), 'throw new Error("old recorder");');
+    await app.workbench.configureBrowser(workspace);
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8'))).toEqual(config);
+    const output = await run(process.execPath, [path.join(dir, 'record.mjs')], { cwd: workspace.folder, timeout: 45000 });
+    const result = JSON.parse(output.split(/\r?\n/).find(line => line.startsWith('{"ok":')));
+    expect(result.ok).toBe(true);
+    expect(result.durationMs).toBeGreaterThanOrEqual(15000);
+    expect(result.steps).toEqual(config.steps);
+    for (const name of ['ready.png', 'playing.png', 'walkthrough.webm', 'trace.zip']) expect((await fs.stat(path.join(result.output, name))).size).toBeGreaterThan(0);
+    config.steps = [{ action: 'goto' }, { action: 'press', key: 'Space', repeat: 0 }];
+    await json(path.join(dir, 'config.json'), config);
+    await expect(run(process.execPath, [path.join(dir, 'record.mjs')], { cwd: workspace.folder, timeout: 30000 })).rejects.toThrow(/press.repeat/);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
 test('dashboard renews expired tokens and preserves the form draft', async ({ page }) => {
   await page.route(`${app.url}/`, async route => {
     const response = await route.fetch();
@@ -133,6 +178,23 @@ test('dashboard renews expired tokens and preserves the form draft', async ({ pa
   await expect.poll(() => rejected).toBe(true);
   await expect(page.getByLabel('Describe your project')).toHaveValue('Retain this draft after reconnecting');
   await expect(page.locator('#updated')).not.toContainText('Server unavailable');
+});
+
+test('risk C through F display the reported trigger safely in activity history', async ({ page }) => {
+  const workspace = await app.workbench.create(); await app.workbench.locks.get(workspace.id);
+  const evidence = ['POST /items/<script>alert(1)</script> returned 201', 'Installed a global dependency', 'Performed privilege escalation', 'Deleted backups'];
+  app.workbench.activity.state(workspace).summaries = evidence.map((text, index) => ({
+    runId: `risk-${index}`, phase: 'development', time: new Date().toISOString(),
+    text: 'Checked reported activity.', risk: assessRisk([{ type: 'tool', text }])
+  }));
+  await page.goto(app.url);
+  await page.locator(`[data-id="${workspace.id}"]`).click();
+  for (const [index, grade] of ['C', 'D', 'E', 'F'].entries()) {
+    const entry = page.locator('#summaries li').filter({ has: page.locator(`.risk-${grade}`) });
+    await expect(entry.locator('.risk-detections')).toContainText(evidence[index]);
+    await expect(entry.locator('.risk-detections')).toContainText('Detected in reported activity');
+  }
+  await expect(page.locator('#summaries script')).toHaveCount(0);
 });
 test('mobile layout remains usable and form drafts survive polling', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });

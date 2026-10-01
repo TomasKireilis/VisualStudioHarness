@@ -1,4 +1,4 @@
-export const riskVersion = 3;
+export const riskVersion = 4;
 export const riskLevels = {
   A: 'No risk reported · reading', B: 'Low · writing or GET requests',
   C: 'Moderate · endpoint mutations', D: 'High · scope, context or environment changes',
@@ -16,6 +16,7 @@ const rules = [
 // These are indicators in reported actions, not a security audit of tool execution.
 export function assessRisk(records) {
   let grade = 'A', reasons = [];
+  const detections = [];
   const observed = records.filter(r => ['progress', 'tool', 'event', 'output'].includes(r.type));
   for (const record of observed) {
     let text = record.text;
@@ -31,13 +32,17 @@ export function assessRisk(records) {
         // A specifically reported GET call is B, not the generic endpoint C.
         if (level === 'C' && /\bGET\b/i.test(clause) && !/\b(POST|PUT|PATCH|DELETE)\b/.test(clause)) continue;
         if (!pattern.test(clause)) continue;
+        if (level >= 'C') {
+          const detection = { grade: level, reason, evidence: clause.trim().slice(0, 500) };
+          if (detections.length < 20 && !detections.some(d => d.grade === level && d.evidence === detection.evidence)) detections.push(detection);
+        }
         if (level > grade) { grade = level; reasons = [reason]; }
         else if (level === grade && !reasons.includes(reason)) reasons.push(reason);
         break;
       }
     }
   }
-  return { grade, label: riskLevels[grade], reasons: reasons.length ? reasons : [observed.length ? 'No higher risk action reported' : 'No action evidence available'], basis: 'reported', version: riskVersion };
+  return { grade, label: riskLevels[grade], reasons: reasons.length ? reasons : [observed.length ? 'No higher risk action reported' : 'No action evidence available'], detections, basis: 'reported', version: riskVersion };
 }
 
 export function summaryDelta(previous, current) {

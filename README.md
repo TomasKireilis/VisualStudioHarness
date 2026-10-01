@@ -41,7 +41,7 @@ Requirements prompts require persistent follow-up on unresolved decisions, inspe
 
 ## Live AI activity history
 
-Activity history starts automatically when an agent request is dispatched or recording begins. The server checks every 30 seconds, saves only changed progress (up to 50 words), and records completion or questions. Repeated sentences and unchanged notes are omitted; old repeated history is also compacted for display. Each entry shows an estimated risk grade based on reported actions: A reading/no risk reported, B writing or GET, C other endpoint calls, D scope/context or environment changes, E hacking/security bypass, F destruction/data theft. Examples of higher risk actions include privilege escalation, disabling security, stealing credentials, exporting private data and destroying backups. Grades do not independently audit tool calls. A warning appears after 90 seconds without reported progress. History survives restarts, and the dashboard reconnects automatically when its token expires.
+Activity history starts automatically when an agent request is dispatched or recording begins. The server checks every 30 seconds, saves only changed progress (up to 50 words), and records completion or questions. Repeated sentences and unchanged notes are omitted; old repeated history is also compacted for display. Each entry shows an estimated risk grade based on reported actions: A reading/no risk reported, B writing or GET, C other endpoint calls, D scope/context or environment changes, E hacking/security bypass, F destruction/data theft. For C–F, the entry also displays the detected category and the reported text that triggered it, including lower detected classes when several occur. New evidence is saved even when the summary and grade stay the same. Examples of higher risk actions include privilege escalation, disabling security, stealing credentials, exporting private data and destroying backups. Grades do not independently audit tool calls. A warning appears after 90 seconds without reported progress. History survives restarts, and the dashboard reconnects automatically when its token expires.
 
 The activity service collects prompts, human input, agent progress notes, structured outputs and recorder events in `.harness/activity.json`. Agents write `.harness/progress/<jobId>.json` with reported file reads/findings, concise decisions, tool outcomes and current actions; the bridge forwards these automatically. The default history uses those reported notes and completion messages, without an additional model call. It cannot read private reasoning or the full Copilot transcript, and its detail depends on the agent writing progress notes. Raw activity retains the latest 500 entries; completed summaries are retained across steps and reloads.
 
@@ -91,6 +91,21 @@ Playwright and the recording runner are prepared under `.harness/demo`. Copilot 
 ```
 
 Use `"start": null` for an already-running app. Start commands use an executable plus an argument array, never a shell command string. The runner waits for the local app, records a 1440×900 WebM, captures a trace, and stops the app process tree afterward. UI detection combines the agent's `uiChanged` flag with common UI file extensions. Other UI technologies depend on the agent setting the flag; this first recorder targets browser UIs.
+
+Recordings last at least 15 seconds by default. Set `minimumDurationMs` in the config to override this (0–60000). This adds viewing time; gameplay requires configured inputs. The AI is instructed to demonstrate the core interaction and capture its result, rather than only record the ready screen.
+
+For keyboard games, use `press` to send browser keyboard events, including repeated inputs during play:
+
+```json
+{
+  "action": "press",
+  "key": "Space",
+  "repeat": 30,
+  "intervalMs": 450
+}
+```
+
+An optional `selector` focuses an element before pressing. Without one, input goes to the page. `repeat` defaults to 1 (maximum 300); `intervalMs` defaults to 250. A sequence can span at most 60 seconds. Tune the timing to the game's physics, capture screenshots before and after gameplay, and assert visible results with `expect` where available. Canvas clicks support `position: { "x": 100, "y": 200 }` relative to the selected element. Recording uses a separate automated browser; AI inputs in another browser are not included in the video. Existing workspaces receive the updated recorder on server restart or demo retry, retaining their configuration; revise old demo steps to include inputs.
 
 Reports contain agent-authored explanations and test outcomes, explicitly labeled as reported, plus server-captured source snapshots. They exclude generated folders, binary files, `.env*`, and files over 1 MB. Per-file before/after code excerpts are limited to 12,000 characters in Markdown; `changes.json` contains the complete captured text. Reports can include source code and should be handled accordingly.
 

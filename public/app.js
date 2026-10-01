@@ -109,7 +109,10 @@ function render() {
   $('#current-activity').textContent = s.activity?.stale ? `No progress reported for over 90 seconds.${s.connected ? ' Check the Copilot chat for a pause, approval or missing reply.' : ' VS Code bridge is disconnected; open the workspace to reconnect.'}` : '';
   const history = s.activity?.summaries || [];
   $('#summary-status').textContent = s.activity?.error ? `Summary unavailable: ${s.activity.error}` : `${labels[s.status] || s.status}. Only changes are saved; checked every 30 seconds.`;
-  const historyHtml = history.slice().reverse().map(e => `<li><strong><span class="risk-grade risk-${esc(e.risk?.grade || 'A')}" title="${esc((e.risk?.reasons || []).join('; '))}">Risk ${esc(e.risk?.grade || 'A')}</span> ${esc(e.phase)}${e.final ? ' · finished' : ''}</strong><br>${esc(e.text)}<time>${new Date(e.time).toLocaleString()}</time></li>`).join('');
+  const historyHtml = history.slice().reverse().map(e => {
+    const detections = (e.risk?.detections || []).map(d => `<div class="risk-detection"><strong>${esc(d.grade)} · ${esc(d.reason)}</strong><br>Reported: ${esc(d.evidence)}</div>`).join('');
+    return `<li><strong><span class="risk-grade risk-${esc(e.risk?.grade || 'A')}" title="${esc((e.risk?.reasons || []).join('; '))}">Risk ${esc(e.risk?.grade || 'A')}</span> ${esc(e.phase)}${e.final ? ' · finished' : ''}</strong><br>${esc(e.text)}${e.risk?.grade >= 'C' ? `<div class="risk-detections">Detected in reported activity:${detections || `<div>${esc((e.risk.reasons || []).join('; '))}<br>Original reported text is unavailable for this historical entry.</div>`}</div>` : ''}<time>${new Date(e.time).toLocaleString()}</time></li>`;
+  }).join('');
   if ($('#summaries').innerHTML !== historyHtml) $('#summaries').innerHTML = historyHtml;
   $('#breadcrumb').textContent = s.title;
   $('#folder-name').textContent = s.id;

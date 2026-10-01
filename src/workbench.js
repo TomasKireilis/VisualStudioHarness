@@ -156,7 +156,7 @@ export class Workbench {
       runtime = { browsersPath: configured === '0' ? '0' : path.resolve(configured) };
       await json(path.join(dir, 'runtime.json'), runtime);
     }
-    for (const file of ['browser.mjs', 'check.mjs']) await fs.copyFile(path.join(project, 'templates/demo', file), path.join(dir, file));
+    for (const file of ['browser.mjs', 'check.mjs', 'record.mjs']) await fs.copyFile(path.join(project, 'templates/demo', file), path.join(dir, file));
     const settingsFile = path.join(session.folder, '.vscode/settings.json');
     let settings;
     try { settings = await readJson(settingsFile); }

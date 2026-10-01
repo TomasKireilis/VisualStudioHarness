@@ -49,11 +49,31 @@ try {
   const page = await context.newPage();
   page.setDefaultTimeout(15000);
   video = page.video();
+  const started = Date.now();
+  const bounded = (value, fallback, min, max, name) => {
+    const number = value === undefined ? fallback : Number(value);
+    if (!Number.isFinite(number) || number < min || number > max) throw new Error(`${name} must be between ${min} and ${max}`);
+    return number;
+  };
+  const minimumDuration = bounded(config.minimumDurationMs, 15000, 0, 60000, 'minimumDurationMs');
   if (!Array.isArray(config.steps) || !config.steps.length) throw new Error('Demo requires at least one step');
   for (const step of config.steps) {
     switch (step.action) {
       case 'goto': await page.goto(local(new URL(step.path || '/', base).href).href, { waitUntil: 'domcontentloaded' }); break;
-      case 'click': await page.locator(step.selector).click(); break;
+      case 'click': await page.locator(step.selector).click(step.position ? { position: step.position } : {}); break;
+      case 'press': {
+        if (typeof step.key !== 'string' || !step.key.trim()) throw new Error('press requires a key, such as Space or ArrowUp');
+        const repeat = bounded(step.repeat, 1, 1, 300, 'press.repeat');
+        if (!Number.isInteger(repeat)) throw new Error('press.repeat must be an integer');
+        const interval = bounded(step.intervalMs, 250, 0, 10000, 'press.intervalMs');
+        if ((repeat - 1) * interval > 60000) throw new Error('A repeated press sequence must fit within 60 seconds');
+        if (step.selector) await page.locator(step.selector).focus();
+        for (let i = 0; i < repeat; i++) {
+          if (i) await page.waitForTimeout(interval);
+          await page.keyboard.press(step.key);
+        }
+        break;
+      }
       case 'fill': await page.locator(step.selector).fill(step.value); break;
       case 'expect': {
         const locator = page.locator(step.selector);
@@ -68,6 +88,8 @@ try {
     result.steps.push(step);
     await page.waitForTimeout(350);
   }
+  await page.waitForTimeout(Math.max(0, minimumDuration - (Date.now() - started)));
+  result.durationMs = Date.now() - started;
   result.ok = true;
 } catch (error) {
   result.error = error.message;
