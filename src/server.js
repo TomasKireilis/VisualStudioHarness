@@ -83,6 +83,7 @@ export async function startServer({ port = 4310, root = 'C:/AIWork', autoOpen = 
         if (req.method !== 'POST') return send(res, 404, { error: 'Unknown endpoint' });
         const input = await body(req);
         switch (parts[3]) {
+          case 'start-review': return send(res, 200, await workbench.startReview(id));
           case 'review-demo': return send(res, 200, await workbench.reviewDemo(id));
           case 'auto-submit': return send(res, 200, await workbench.setAutoSubmit(id, input.enabled));
           case 'rollback': return send(res, 200, await workbench.rollback(id, textField(input.reason, 'reason'), input.stopped === true, input.phase));

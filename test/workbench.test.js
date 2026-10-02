@@ -34,6 +34,8 @@ test('requirements questions, human answers, approval and backend completion per
   const reply = { jobId: job.id, kind: 'development_complete', message: 'Added role check.', uiChanged: false, impact: [{ file: 'api.js', description: 'Manager-only edits' }], tests: ['Validation not run in this test fixture'] };
   await w.response(id, reply);
   assert.equal(w.get(id).status, 'complete');
+  assert.equal(w.get(id).phase, 'demo');
+  assert.equal(await w.claim(id), null, 'PR review waits for human result approval');
   const report = await fs.readFile(path.join(folder, 'artifacts/impact.md'), 'utf8');
   assert.match(report, /Manager-only edits/); assert.match(report, /export const canEdit/);
   const count = w.get(id).messages.length;
@@ -42,6 +44,15 @@ test('requirements questions, human answers, approval and backend completion per
   const restarted = new Workbench({ root: w.root, url: 'http://127.0.0.1:9999' });
   await restarted.load();
   assert.equal(restarted.get(id).status, 'complete');
+  assert.equal(restarted.get(id).phase, 'demo');
+  await restarted.reviewDemo(id);
+  const demoReview = await restarted.claim(id);
+  await restarted.response(id, { jobId: demoReview.id, kind: 'demo_review_complete', message: 'Result checked.' });
+  assert.equal(restarted.get(id).phase, 'demo', 'AI review cannot approve the result for the human');
+  assert.equal(await restarted.claim(id), null);
+  await restarted.startReview(id);
+  assert.ok(restarted.get(id).resultApprovedAt);
+  assert.equal((await restarted.claim(id)).kind, 'pr_review');
   assert.equal((await readJson(path.join(folder, '.harness/bridge.json'))).serverUrl, 'http://127.0.0.1:9999');
 });
 test('jobs claim exactly once; retry invalidates late responses', async () => {
@@ -67,9 +78,38 @@ test('invalid transitions and malformed replies do not complete a job', async ()
 test('setup errors are visible and retryable', async () => {
   const { w, id } = await fixture({ provision: async () => { throw new Error('Registry unavailable'); } });
   assert.equal(w.get(id).status, 'error'); assert.match(w.get(id).error, /Registry/);
+  assert.equal(w.get(id).phase, 'preparation');
   w.provision = async () => {};
   await w.setup(id);
   assert.equal(w.get(id).demoReady, true);
+  assert.equal(w.get(id).phase, 'requirements');
+  assert.ok(w.get(id).preparedAt);
+  await assert.rejects(w.setup(id), /complete and locked/);
+});
+
+test('preparation remains locked after restart and cannot be a rollback target', async () => {
+  const { w, id, root } = await fixture();
+  const restarted = new Workbench({ root, url: w.url, autoOpen: false });
+  await restarted.load();
+  await assert.rejects(restarted.setup(id), /complete and locked/);
+  await assert.rejects(restarted.rollback(id, 'Reinstall tools', true, 'preparation'), /no previous step/);
+  restarted.get(id).phase = 'development';
+  await assert.rejects(restarted.rollback(id, 'Reinstall tools', true, 'preparation'), /complete and locked/);
+  assert.equal(restarted.get(id).phase, 'development');
+});
+
+test('legacy interrupted setup loads into preparation and can finish', async () => {
+  const { w, id, folder, root } = await fixture({ provision: async () => { throw new Error('Interrupted'); } });
+  const session = w.get(id);
+  session.phase = 'requirements'; session.status = 'setting_up';
+  await w.save(session);
+  const restarted = new Workbench({ root, url: w.url, autoOpen: false, provision: async () => {} });
+  await restarted.load();
+  assert.equal(restarted.get(id).phase, 'preparation');
+  assert.equal(restarted.get(id).status, 'error');
+  await restarted.setup(id);
+  assert.equal(restarted.get(id).phase, 'requirements');
+  assert.equal((await readJson(path.join(folder, '.harness/session.json'))).demoReady, true);
 });
 test('UI source changes trigger the demo even if the agent flag is false', async () => {
   const { w, id, folder } = await fixture();
@@ -133,6 +173,64 @@ test('HTTP routes protect bridge tokens, cross-origin requests and private files
 });
 
 const assessment = { feasible: true, evidence: 'Inspected Node runtime and existing files', steps: ['Implement and test'], technologies: ['Node.js'], codeImpact: ['New API module'] };
+const passingChecks = Object.fromEntries(['features', 'readability', 'formatting', 'tests', 'architecture'].map(key => [key, { passed: true, evidence: `Verified ${key} in fixture` }]));
+
+test('PR review loops through refactoring until clean, persists evidence and leaves handoff empty', async () => {
+  const { w, id, folder } = await fixture();
+  const dev = await develop(w, id);
+  await w.response(id, { jobId: dev.id, kind: 'development_complete', uiChanged: false, impact: [], tests: [] });
+  await w.startReview(id);
+  let review = await w.claim(id);
+  assert.equal(review.kind, 'pr_review');
+  assert.match(review.prompt, /Do not edit source files/);
+  await assert.rejects(w.response(id, { jobId: review.id, kind: 'refactoring_complete' }), /Invalid refactoring/);
+  await assert.rejects(w.response(id, { jobId: review.id, kind: 'pr_review_complete', findings: [], tests: ['npm test: failed'], checks: { ...passingChecks, tests: { passed: false, evidence: 'Test failed' } } }), /actionable findings/);
+  for (const finding of ['api.js: extract infrastructure dependency', 'api.js: fix regression introduced by refactor']) {
+    const reply = { jobId: review.id, kind: 'pr_review_complete', findings: [finding], checks: passingChecks, tests: ['Fixture validation passed'] };
+    await w.response(id, reply);
+    assert.equal(w.get(id).phase, 'refactoring');
+    const jobCount = w.get(id).jobs.length;
+    await w.response(id, reply);
+    assert.equal(w.get(id).jobs.length, jobCount);
+    const refactor = await w.claim(id);
+    assert.equal(refactor.kind, 'refactoring');
+    assert.ok(refactor.prompt.includes(finding));
+    await w.response(id, { jobId: refactor.id, kind: 'questions', questions: ['Which adapter should be used?'] });
+    await w.answer(id, 'Use the existing adapter');
+    const continued = await w.claim(id);
+    assert.equal(continued.kind, 'refactoring');
+    await fs.writeFile(path.join(folder, 'api.js'), `// Fixed: ${finding}\n`);
+    await w.response(id, { jobId: continued.id, kind: 'refactoring_complete', addressedFindings: [finding], uiChanged: false, impact: [{ file: 'api.js', description: finding }], tests: ['Fixture validation passed'] });
+    assert.equal(w.get(id).phase, 'pr_review');
+    const restarted = new Workbench({ root: w.root, url: w.url });
+    await restarted.load();
+    assert.equal(restarted.get(id).phase, 'pr_review');
+    assert.deepEqual(restarted.get(id).reviewFindings, [finding]);
+    review = await w.claim(id);
+  }
+  await w.response(id, { jobId: review.id, kind: 'pr_review_complete', findings: [], checks: passingChecks, tests: ['Fixture validation passed'] });
+  assert.equal(w.get(id).phase, 'handoff');
+  assert.equal(w.get(id).status, 'handoff_pending');
+  assert.equal(await w.claim(id), null);
+  assert.equal(w.get(id).reviews.length, 3);
+  assert.equal(w.get(id).refactorings.length, 2);
+  assert.equal(w.get(id).artifacts.filter(file => file.endsWith('/impact.md')).length, 4);
+  const restarted = new Workbench({ root: w.root, url: w.url }); await restarted.load();
+  assert.equal(restarted.get(id).phase, 'handoff');
+  assert.equal(await restarted.claim(id), null);
+});
+
+test('existing completed demos can start review, and cancelled reviews cannot advance the loop', async () => {
+  const { w, id } = await fixture();
+  await assert.rejects(w.startReview(id), /Finish the demo/);
+  const s = w.get(id); s.phase = 'demo'; s.status = 'complete';
+  await w.startReview(id);
+  const job = await w.claim(id);
+  await w.rollback(id, 'Review the requirements again', true, 'requirements');
+  await w.response(id, { jobId: job.id, kind: 'pr_review_complete', findings: [], checks: passingChecks, tests: ['Fixture passed'] });
+  assert.equal(s.phase, 'requirements');
+  assert.equal(s.jobs.at(-1).kind, 'requirements');
+});
 async function develop(w, id) {
   await w.brief(id, 'Build an API');
   let job = await w.claim(id);
@@ -164,6 +262,9 @@ test('human and AI rollback preserve source, baseline, feedback and invalidate s
   assert.deepEqual(await readJson(path.join(folder, '.harness/baseline.json')), baseline);
   const dev = await w.claim(id);
   await w.response(id, { jobId: dev.id, kind: 'development_complete', uiChanged: false, impact: [], tests: [] });
+  // Exercise a previously completed demo retained from the earlier workflow.
+  w.get(id).phase = 'demo'; w.get(id).status = 'complete';
+  w.get(id).jobs.at(-1).status = 'cancelled';
   await w.reviewDemo(id);
   const review = await w.claim(id);
   assert.equal(review.kind, 'demo_review');
@@ -263,6 +364,7 @@ test('automatic chat stays responsive and setup log exists while provisioning is
     const changed = await Promise.race([w.setAutoSubmit(s.id, false), new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('Toggle blocked behind setup')), 1500); timer.unref(); })]);
     assert.equal(changed.autoSubmit, false);
     assert.equal(changed.status, 'setting_up');
+    assert.equal(changed.phase, 'preparation');
     assert.match(await fs.readFile(path.join(s.folder, '.harness/setup.log'), 'utf8'), /Setup is starting/);
   } finally { release(); await w.locks.get(s.id); }
   assert.equal(w.get(s.id).status, 'awaiting_brief');

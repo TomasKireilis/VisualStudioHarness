@@ -18,6 +18,68 @@ test.beforeAll(async () => {
   } });
 });
 test.afterAll(async () => { await new Promise(resolve => app.server.close(resolve)); });
+
+test('requirements separate business and technical information and approve below the editor', async ({ page }) => {
+  const workspace = await app.workbench.create();
+  await app.workbench.locks.get(workspace.id);
+  await app.workbench.brief(workspace.id, 'A greeting page');
+  const job = await app.workbench.claim(workspace.id);
+  await app.workbench.response(workspace.id, { jobId: job.id, kind: 'requirements_ready', requirements: '# Greeting page\n\n## Goal\nShow a greeting.\n\n## Acceptance criteria\nTyping hello shows hello.\n\n## Implementation Plan\nCreate index.html.\n\n## Technologies\nHTML and JavaScript.', assessment: { feasible: true, evidence: 'Browser check passed.', steps: ['Build the page'], technologies: ['HTML'], codeImpact: ['New page'] } });
+  await page.goto(app.url);
+  await page.locator(`[data-id="${workspace.id}"]`).click();
+  await expect(page.getByRole('heading', { name: 'Business requirements' })).toBeVisible();
+  const editor = page.getByLabel('REQUIREMENTS.md', { exact: true });
+  await expect(editor).toHaveValue(/Typing hello/);
+  await expect(editor).not.toHaveValue(/index.html/);
+  expect((await editor.boundingBox()).height).toBeGreaterThanOrEqual(500);
+  const approval = page.getByRole('button', { name: 'Approve & start development' });
+  const box = await editor.boundingBox();
+  expect((await approval.boundingBox()).y).toBeGreaterThanOrEqual(box.y + box.height);
+  await page.getByText('Technical details', { exact: true }).click();
+  await expect(page.getByLabel('Technical requirements')).toHaveValue(/index.html/);
+  await editor.fill('# Business requirements\n\nShow a friendly greeting.');
+  await approval.click();
+  await expect(page.getByRole('heading', { name: 'Building your solution' })).toBeVisible();
+  expect(app.workbench.get(workspace.id).requirements).toContain('Show a friendly greeting.');
+  expect(app.workbench.get(workspace.id).requirements).toContain('Create index.html.');
+  await page.locator('[data-phase="requirements"]').click();
+  await expect(page.getByRole('heading', { name: 'Business requirements' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Approve & start development' })).toHaveCount(0);
+});
+
+test('preparation has its own stage, retries failures and locks on completion', async ({ page }) => {
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const provision = app.workbench.provision;
+  app.workbench.provision = async () => { await pending; throw new Error('Browser setup interrupted'); };
+  let workspace;
+  try {
+    await page.goto(app.url);
+    await page.getByRole('button', { name: 'New workspace' }).click();
+    await expect(page.locator('#phase-label')).toHaveText('STEP 01 / PREPARATION');
+    await expect(page.locator('[data-phase="preparation"] .spinner')).toBeVisible();
+    workspace = [...app.workbench.sessions.values()].at(-1);
+    await expect(page.locator('[data-phase="requirements"]')).toBeDisabled();
+    await expect(page.getByLabel('Describe your project')).toHaveCount(0);
+    release();
+    await expect(page.getByRole('button', { name: 'Retry environment setup' })).toBeVisible();
+    app.workbench.provision = async () => {};
+    await page.getByRole('button', { name: 'Retry environment setup' }).click();
+    await expect(page.getByLabel('Describe your project')).toBeVisible();
+    await expect(page.locator('#phase-label')).toHaveText('STEP 02 / REQUIREMENTS');
+    await expect(page.locator('[data-phase="preparation"]')).toContainText('🔒');
+    await page.reload();
+    await page.locator('[data-phase="preparation"]').click();
+    await expect(page.getByRole('heading', { name: 'Environment ready · locked' })).toBeVisible();
+    const response = await page.request.post(`${app.url}/api/sessions/${workspace.id}/setup`, { headers: { 'X-Workbench-Token': app.uiToken }, data: {} });
+    expect(response.ok()).toBe(false);
+    expect(workspace.phase).toBe('requirements');
+  } finally {
+    release();
+    if (workspace) await app.workbench.locks.get(workspace.id);
+    app.workbench.provision = provision;
+  }
+});
 test('guided requirements, development, real Playwright video and artifact review', async ({ page }) => {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto(app.url);
@@ -26,6 +88,12 @@ test('guided requirements, development, real Playwright video and artifact revie
   await expect(page.getByLabel('Describe your project')).toBeVisible();
   await page.screenshot({ path: '.local/dashboard-desktop.png', fullPage: true });
   const s = [...app.workbench.sessions.values()].at(-1);
+  await expect(page.locator('[data-phase="preparation"]')).toContainText('🔒');
+  await page.locator('[data-phase="preparation"]').click();
+  await expect(page.getByRole('heading', { name: 'Environment ready · locked' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Retry environment setup' })).toHaveCount(0);
+  await expect(page.locator('#rollback-controls')).toBeEmpty();
+  await page.locator('[data-phase="requirements"]').click();
   await expect(page.getByRole('button', { name: 'Automatic chat: On' })).toBeVisible();
   await page.getByRole('button', { name: 'Automatic chat: On' }).click();
   await expect(page.getByRole('button', { name: 'Automatic chat: Off' })).toBeVisible();
@@ -88,7 +156,10 @@ test('guided requirements, development, real Playwright video and artifact revie
     steps: [{ action: 'goto', path: '/' }, { action: 'fill', selector: 'input[name=title]', value: 'Launch plan' }, { action: 'click', selector: 'button' }, { action: 'expect', selector: 'section', text: 'Launch plan' }, { action: 'screenshot', name: 'created-project' }]
   });
   await app.workbench.response(s.id, { jobId: job.id, kind: 'development_complete', message: 'Project creation implemented.', uiChanged: false, impact: [{ file: 'app.cjs', description: 'Local project tracker demo' }], tests: ['Browser demo will validate project creation.'] });
-  await expect(page.locator('#status')).toHaveText('Complete', { timeout: 60000 });
+  await expect.poll(() => s.status, { timeout: 60000 }).toBe('complete');
+  expect(s.phase).toBe('demo');
+  expect(await app.workbench.claim(s.id)).toBeNull();
+  await expect(page.locator('#status')).toHaveText('Ready for your approval');
   await expect(page.locator('#workspace-content')).not.toContainText('A couple of decisions first.');
   await page.locator('[data-phase="development"]').click();
   await expect(page.locator('#workspace-content')).toContainText('Project creation implemented.');
@@ -103,9 +174,32 @@ test('guided requirements, development, real Playwright video and artifact revie
   await expect(page.locator('.artifact')).toHaveCount(0);
   await expect(page.getByText('Read the change report', { exact: true })).toHaveCount(0);
   expect((await fs.readFile(path.join(s.folder, 'artifacts/impact.md'), 'utf8'))).toContain('Local project tracker demo');
+  await page.getByRole('button', { name: 'Approve result & start PR review' }).click();
+  await expect(page.getByRole('heading', { name: 'Checking features and code quality' })).toBeVisible();
+  expect(s.resultApprovedAt).toBeTruthy();
+  const checks = Object.fromEntries(['features', 'readability', 'formatting', 'tests', 'architecture'].map(key => [key, { passed: true, evidence: `Checked ${key}` }]));
+  job = await app.workbench.claim(s.id);
+  expect(job.kind).toBe('pr_review');
+  await app.workbench.response(s.id, { jobId: job.id, kind: 'pr_review_complete', message: 'One issue needs fixing.', findings: ['Reject empty project titles in app.cjs'], checks, tests: ['Fixture review checks passed'] });
+  await expect(page.locator('[data-phase="refactoring"] .spinner')).toBeVisible();
+  await page.locator('[data-phase="refactoring"]').click();
+  await expect(page.locator('#workspace-content')).toContainText('Reject empty project titles');
+  job = await app.workbench.claim(s.id);
+  expect(job.kind).toBe('refactoring');
+  await app.workbench.response(s.id, { jobId: job.id, kind: 'refactoring_complete', message: 'Cleaned up validation.', addressedFindings: ['Empty titles now rejected'], uiChanged: false, impact: [], tests: ['Fixture validation passed'] });
+  await expect(page.locator('[data-phase="pr_review"] .spinner')).toBeVisible();
+  await page.locator('[data-phase="pr_review"]').click();
+  await expect(page.locator('#workspace-content')).toContainText('PR review 1');
+  job = await app.workbench.claim(s.id);
+  await app.workbench.response(s.id, { jobId: job.id, kind: 'pr_review_complete', message: 'All checks passed.', findings: [], checks, tests: ['Fixture checks passed'] });
+  await expect(page.locator('#status')).toHaveText('Ready for human PR');
+  await page.locator('[data-phase="handoff"]').click();
+  await expect(page.locator('#workspace-content')).toContainText('Git push and human PR will be added here later.');
+  expect(await app.workbench.claim(s.id)).toBeNull();
   await page.screenshot({ path: '.local/dashboard-complete.png', fullPage: true });
   const range = await fetch(`${app.url}/api/sessions/${s.id}/file?path=${encodeURIComponent(videoFile)}`, { headers: { 'X-Workbench-Token': app.uiToken, Range: 'bytes=0-99' } });
   expect(range.status).toBe(206); expect((await range.arrayBuffer()).byteLength).toBe(100);
+  await page.locator('[data-phase="development"]').click();
   await page.getByText('Return to previous step', { exact: true }).click();
   await page.getByLabel('Bug or question to resolve').fill('Empty titles should be rejected');
   await page.getByRole('button', { name: 'Return & continue' }).click();

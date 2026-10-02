@@ -19,13 +19,17 @@
     <div id="toast" role="alert" hidden></div>
     <div class="page-heading"><div><div class="eyebrow">FROM AN IDEA TO SOMETHING REAL</div><h1>Let’s build it, together.</h1><p>You bring the direction. Your AI handles the development.</p></div><button class="secondary" id="open-code">↗ Open VS Code</button></div>
     <section class="steps" aria-label="Project stages">
-      <button class="step" data-phase="requirements"><span class="step-number">01</span><span><strong>Define the work</strong><small>Gather & approve requirements</small></span><span class="step-mark"></span></button>
-      <button class="step" data-phase="development"><span class="step-number">02</span><span><strong>Build the solution</strong><small>Your AI gets to work</small></span><span class="step-mark"></span></button>
-      <button class="step" data-phase="demo"><span class="step-number">03</span><span><strong>See the result</strong><small>Watch, review & explore</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="preparation"><span class="step-number">01</span><span><strong>Prepare environment</strong><small>Verify tools, then lock setup</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="requirements"><span class="step-number">02</span><span><strong>Define the work</strong><small>Gather & approve requirements</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="development"><span class="step-number">03</span><span><strong>Build the solution</strong><small>Your AI gets to work</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="demo"><span class="step-number">04</span><span><strong>See the result</strong><small>Watch, review & explore</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="pr_review"><span class="step-number">05</span><span><strong>PR review</strong><small>Verify features & quality</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="refactoring"><span class="step-number">06</span><span><strong>Refactor & clean up</strong><small>Fix findings, then review again</small></span><span class="step-mark"></span></button>
+      <button class="step" data-phase="handoff"><span class="step-number">07</span><span><strong>Git push & human PR</strong><small>Coming later</small></span><span class="step-mark"></span></button>
     </section>
     <div class="content-grid">
       <section class="panel primary-panel">
-        <div class="panel-heading"><div><span class="section-label" id="phase-label">STEP 01 / REQUIREMENTS</span><h2 id="panel-title">Start with your idea</h2></div><span id="status" class="pill">Preparing</span></div>
+        <div class="panel-heading"><div><span class="section-label" id="phase-label">STEP 01 / PREPARATION</span><h2 id="panel-title">Start with your idea</h2></div><span id="status" class="pill">Preparing</span></div>
         <div class="actions"><button class="secondary" id="auto-submit" aria-pressed="true">Automatic chat: On</button></div><div id="rollback-controls"></div><div id="workspace-content"></div>
       </section>
       <aside class="details">

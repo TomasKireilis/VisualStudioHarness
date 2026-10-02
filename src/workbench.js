@@ -7,6 +7,7 @@ import { json, readJson, snapshot, changes, impactMarkdown } from './files.js';
 import { run, npmCli, openCode } from './process.js';
 import { ActivityService } from './activity.js';
 import { makePrompt } from './prompts.js';
+import { phases, validateReview, validateRefactoring } from './workflow.js';
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const now = () => new Date().toISOString();
@@ -90,6 +91,7 @@ export class Workbench {
         if (session.id !== entry.name) continue;
         session.folder = path.join(this.root, entry.name);
         session.lastHeartbeat = null;
+        if (!session.demoReady && !session.brief && ['setting_up', 'error'].includes(session.status)) session.phase = 'preparation';
         if (['setting_up', 'recording'].includes(session.status)) {
           session.status = 'error'; session.error = 'Server stopped during an operation. Retry setup or demo.';
         }
@@ -118,7 +120,7 @@ export class Workbench {
     await fs.writeFile(path.join(folder, '.github/copilot-instructions.md'), 'This workspace is managed by AI Workbench. Follow the current harness prompt and REQUIREMENTS.md. Return structured replies in the specified .harness/responses/<jobId>.json file. Demo tooling is preinstalled in .harness/demo. Never use Copilot CLI. Keep company tool and workspace trust settings intact.\n');
     await fs.writeFile(path.join(folder, '.gitignore'), 'node_modules/\n.harness/\nartifacts/\n.env*\n');
     await fs.writeFile(path.join(folder, 'REQUIREMENTS.md'), '# Requirements\n\nWaiting for the project brief.\n');
-    const session = { id, folder, token: crypto.randomBytes(32).toString('hex'), title: 'Untitled workspace', createdAt: now(), phase: 'requirements', status: 'setting_up', autoSubmit: true, brief: '', requirements: '', messages: [], jobs: [], events: [], artifacts: [], demoReady: false, error: null, lastHeartbeat: null };
+    const session = { id, folder, token: crypto.randomBytes(32).toString('hex'), title: 'Untitled workspace', createdAt: now(), phase: 'preparation', status: 'setting_up', autoSubmit: true, brief: '', requirements: '', messages: [], jobs: [], events: [], artifacts: [], demoReady: false, error: null, lastHeartbeat: null };
     this.sessions.set(id, session);
     this.event(session, 'Workspace created. Preparing Playwright and Chromium.');
     await this.bridge(session);
@@ -129,11 +131,13 @@ export class Workbench {
   async setup(id) {
     return this.exclusive(id, async () => {
       const session = this.get(id);
+      if (session.demoReady) throw Object.assign(new Error('Environment preparation is complete and locked'), { status: 409 });
+      if (session.phase !== 'preparation') throw new Error('Environment preparation is not the active step');
       session.status = 'setting_up'; session.error = null;
       await this.save(session);
       try {
         await this.provision(session);
-        session.demoReady = true; session.status = 'awaiting_brief';
+        session.demoReady = true; session.preparedAt = now(); session.phase = 'requirements'; session.status = 'awaiting_brief';
         this.event(session, 'Playwright and Chromium are ready. Add your project brief.');
         if (this.autoOpen) {
           try { await this.launch(session.folder, path.join(project, 'extension')); this.event(session, 'Requested a VS Code window. Waiting for the workspace bridge to connect.'); }
@@ -198,10 +202,18 @@ export class Workbench {
         onOutput('Installing Playwright from npm (up to two minutes).\n');
         await run(process.execPath, [await npmCli(), 'install', '--prefer-offline', '--no-audit', '--no-fund', '--fetch-retries=0', '--fetch-timeout=30000'], { cwd, onOutput, timeout: 120000 });
       }
-      onOutput('Checking Chromium browser cache; downloading only if missing.\n');
-      await run(process.execPath, [path.join(cwd, 'node_modules/@playwright/test/cli.js'), 'install', 'chromium'], { cwd, onOutput, timeout: 120000, env });
-      onOutput('Verifying Chromium can launch and render a page.\n');
-      await run(process.execPath, [path.join(cwd, 'check.mjs')], { cwd, onOutput, timeout: 30000, env });
+      onOutput(`Verifying cached Chromium and video recording in ${runtime.browsersPath}.\n`);
+      try {
+        await run(process.execPath, [path.join(cwd, 'check.mjs')], { cwd, onOutput, timeout: 30000, env });
+        onOutput('Cached browser and recording tools work; skipping the browser installer.\n');
+      } catch {
+        onOutput('Cached browser verification failed. Installing Chromium (up to five minutes).\n');
+        try {
+          await run(process.execPath, [path.join(cwd, 'node_modules/@playwright/test/cli.js'), 'install', 'chromium'], { cwd, onOutput, timeout: 300000, env });
+        } catch (error) { throw new Error(`Chromium installation failed: ${error.message}. Check the installation log and browser download access.`); }
+        onOutput('Verifying Chromium can launch, render a page and record video.\n');
+        await run(process.execPath, [path.join(cwd, 'check.mjs')], { cwd, onOutput, timeout: 30000, env });
+      }
       onOutput('Playwright and Chromium are ready.\n');
     } catch (error) {
       onOutput(`Setup failed: ${error.message}\n`);
@@ -215,7 +227,7 @@ export class Workbench {
     this.activity.record(session, 'prompt', job.prompt);
     session.status = 'waiting_for_agent';
     session.error = null;
-    this.event(session, `Queued ${kind === 'requirements' ? 'requirements discussion' : kind === 'demo_review' ? 'demo review' : 'development'} for VS Code Copilot.`);
+    this.event(session, `Queued ${kind.replaceAll('_', ' ')} for VS Code Copilot.`);
     await this.save(session);
     return job;
   }
@@ -309,7 +321,7 @@ export class Workbench {
       if (!job) throw new Error('Unknown job ID');
       if (job.status === 'complete' || job.status === 'cancelled') return this.public(s);
       if (job.status !== 'dispatched') throw new Error('Job has not been dispatched');
-      if (!['questions', 'requirements_ready', 'development_complete', 'rollback', 'demo_review_complete'].includes(reply.kind)) throw new Error('Invalid reply kind');
+      if (!['questions', 'requirements_ready', 'development_complete', 'rollback', 'demo_review_complete', 'pr_review_complete', 'refactoring_complete'].includes(reply.kind)) throw new Error('Invalid reply kind');
       if (reply.message !== undefined && typeof reply.message !== 'string') throw new Error('message must be a string');
       if (reply.kind === 'questions' && (!Array.isArray(reply.questions) || !reply.questions.length || reply.questions.some(q => typeof q !== 'string' || !q.trim()))) throw new Error('Reply requires nonempty questions');
       if (reply.kind === 'requirements_ready' && (job.kind !== 'requirements' || typeof reply.requirements !== 'string' || !reply.requirements.trim())) throw new Error('Invalid requirements reply');
@@ -317,6 +329,14 @@ export class Workbench {
       if (reply.kind === 'requirements_ready') validateAssessment(reply.assessment);
       if (reply.kind === 'rollback' && (!['development', 'demo'].includes(s.phase) || typeof reply.message !== 'string' || !reply.message.trim())) throw new Error('Rollback requires a development job and a reason');
       if (reply.kind === 'demo_review_complete' && job.kind !== 'demo_review') throw new Error('Invalid demo review reply');
+      if (reply.kind === 'pr_review_complete') {
+        if (job.kind !== 'pr_review') throw new Error('Invalid PR review reply');
+        validateReview(reply);
+      }
+      if (reply.kind === 'refactoring_complete') {
+        if (job.kind !== 'refactoring') throw new Error('Invalid refactoring reply');
+        validateRefactoring(reply);
+      }
       this.activity.record(s, 'output', JSON.stringify(reply));
       this.activity.stop(s);
       if (reply.kind === 'rollback') {
@@ -324,23 +344,33 @@ export class Workbench {
         await this.reopen(s, reply.message, 'ai');
         return this.public(s);
       }
-      if (reply.kind === 'demo_review_complete') {
+      let nextJob;
+      if (reply.kind === 'pr_review_complete') {
+        s.reviews ||= [];
+        s.reviews.push({ jobId: job.id, time: now(), findings: reply.findings, checks: reply.checks, tests: reply.tests });
+        s.reviewFindings = reply.findings;
+        s.phase = reply.findings.length ? 'refactoring' : 'handoff';
+        s.status = reply.findings.length ? 'waiting_for_agent' : 'handoff_pending';
+        nextJob = reply.findings.length ? 'refactoring' : null;
+        this.event(s, reply.findings.length ? `PR review found ${reply.findings.length} issue(s). Refactoring next.` : 'PR review passed. Ready for the future Git push and human PR step.');
+      } else if (reply.kind === 'refactoring_complete') {
+        await this.recordImpact(s, job, reply);
+        s.refactorings ||= [];
+        s.refactorings.push({ jobId: job.id, time: now(), addressedFindings: reply.addressedFindings, tests: reply.tests });
+        s.phase = 'pr_review';
+        nextJob = 'pr_review';
+        this.event(s, 'Refactoring finished. Running a fresh PR review.');
+      } else if (reply.kind === 'demo_review_complete') {
         s.status = s.demoOutcome || 'complete';
         this.event(s, reply.message || 'AI demo review finished.');
       } else if (reply.kind === 'development_complete') {
-        const before = await readJson(path.join(s.folder, '.harness/baseline.json'));
-        const diff = changes(before, await snapshot(s.folder));
-        await fs.writeFile(path.join(s.folder, 'artifacts/impact.md'), impactMarkdown(reply, diff));
-        await json(path.join(s.folder, 'artifacts/changes.json'), diff);
-        const reportDir = `artifacts/reports/${job.id}`;
-        await fs.mkdir(path.join(s.folder, reportDir), { recursive: true });
-        await fs.copyFile(path.join(s.folder, 'artifacts/impact.md'), path.join(s.folder, reportDir, 'impact.md'));
-        await fs.copyFile(path.join(s.folder, 'artifacts/changes.json'), path.join(s.folder, reportDir, 'changes.json'));
-        s.artifacts = [...new Set([...s.artifacts, 'artifacts/impact.md', 'artifacts/changes.json', `${reportDir}/impact.md`, `${reportDir}/changes.json`])];
+        const diff = await this.recordImpact(s, job, reply);
         // A visible-file change also triggers recording when an agent forgets its flag.
         s.uiChanged = reply.uiChanged || diff.some(d => /\.(html|css|scss|jsx|tsx|vue|svelte)$/i.test(d.file));
         s.phase = 'demo'; s.status = s.uiChanged ? 'demo_pending' : 'complete';
-        this.event(s, s.uiChanged ? 'Development finished. Recording the UI walkthrough.' : 'Development finished. Backend impact report is ready.');
+        s.resultApprovedAt = null;
+        s.reviewFindings = [];
+        this.event(s, s.uiChanged ? 'Development finished. Recording the UI walkthrough.' : 'Development finished. Backend impact report is ready for your approval.');
       } else if (reply.kind === 'questions') {
         s.status = 'awaiting_human';
         s.questions = reply.questions;
@@ -353,8 +383,31 @@ export class Workbench {
       }
       job.status = 'complete'; job.completedAt = now(); s.error = null;
       s.messages.push({ role: 'ai', phase: job.kind === 'demo_review' ? 'demo' : job.kind, text: reply.message || (reply.kind === 'requirements_ready' ? 'Requirements are ready for review.' : 'Work completed.'), questions: reply.questions || [], time: now() });
-      await this.save(s);
+      if (nextJob) await this.queue(s, nextJob);
+      else await this.save(s);
       if (s.status === 'demo_pending') setImmediate(() => this.demo(id).catch(() => {}));
+      return this.public(s);
+    });
+  }
+  async recordImpact(s, job, reply) {
+    const before = await readJson(path.join(s.folder, '.harness/baseline.json'));
+    const diff = changes(before, await snapshot(s.folder));
+    const reportDir = `artifacts/reports/${job.id}`;
+    await fs.mkdir(path.join(s.folder, reportDir), { recursive: true });
+    await fs.writeFile(path.join(s.folder, 'artifacts/impact.md'), impactMarkdown(reply, diff));
+    await json(path.join(s.folder, 'artifacts/changes.json'), diff);
+    for (const name of ['impact.md', 'changes.json']) await fs.copyFile(path.join(s.folder, 'artifacts', name), path.join(s.folder, reportDir, name));
+    s.artifacts = [...new Set([...s.artifacts, 'artifacts/impact.md', 'artifacts/changes.json', `${reportDir}/impact.md`, `${reportDir}/changes.json`])];
+    return diff;
+  }
+  async startReview(id) {
+    return this.exclusive(id, async () => {
+      const s = this.get(id);
+      if (s.phase !== 'demo' || s.status !== 'complete') throw new Error('Finish the demo before starting PR review');
+      s.resultApprovedAt = now();
+      s.phase = 'pr_review';
+      this.event(s, 'You approved the result. Starting PR review.');
+      await this.queue(s, 'pr_review');
       return this.public(s);
     });
   }
@@ -378,20 +431,22 @@ export class Workbench {
   }
   async reopen(s, reason, actor, target) {
     const from = s.phase;
-    s.phase = target || (from === 'demo' ? 'development' : 'requirements');
+    s.phase = target || phases[phases.indexOf(from) - 1];
+    s.resultApprovedAt = null;
     s.questions = []; s.error = null;
     s.messages.push({ role: actor === 'human' ? 'human' : 'ai', phase: s.phase, text: `Return from ${from} to ${s.phase}: ${reason}`, time: now() });
     s.rollbacks ||= [];
     s.rollbacks.push({ from, to: s.phase, reason, actor, time: now(), artifacts: [...s.artifacts] });
     this.activity.stop(s);
     this.event(s, `Returned to ${s.phase}: ${reason}`);
-    await this.queue(s, s.phase);
+    await this.queue(s, s.phase === 'demo' ? 'demo_review' : s.phase);
   }
   async rollback(id, reason, stopped = false, target) {
     return this.exclusive(id, async () => {
       const s = this.get(id);
-      if (!['development', 'demo'].includes(s.phase)) throw new Error('There is no previous step');
-      if (target && !(['requirements', 'development', 'demo'].indexOf(target) >= 0 && ['requirements', 'development', 'demo'].indexOf(target) < ['requirements', 'development', 'demo'].indexOf(s.phase))) throw new Error('Choose an earlier step');
+      if (!phases.includes(s.phase) || ['preparation', 'requirements'].includes(s.phase)) throw new Error('There is no previous step');
+      if (target === 'preparation') throw new Error('Environment preparation is complete and locked');
+      if (target && !(phases.indexOf(target) > 0 && phases.indexOf(target) < phases.indexOf(s.phase))) throw new Error('Choose an earlier step');
       if (s.jobs.some(j => j.status === 'dispatched') && !stopped) throw Object.assign(new Error('Stop the active Copilot request and confirm it is stopped first'), { status: 409 });
       if (typeof reason !== 'string' || !reason.trim()) throw new Error('Describe the bug or question before returning');
       for (const job of s.jobs) if (['queued', 'dispatched'].includes(job.status)) job.status = 'cancelled';
@@ -410,7 +465,7 @@ export class Workbench {
       try {
         const runtime = await this.configureBrowser(s);
         await run(process.execPath, [path.join(s.folder, '.harness/demo/record.mjs')], { cwd: s.folder, env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: runtime.browsersPath }, timeout: 180000, onOutput: text => this.activity.record(s, 'tool', text) });
-        s.status = 'complete'; this.event(s, 'Video, screenshots and browser trace captured.');
+        s.status = 'complete'; s.resultApprovedAt = null; this.event(s, 'Video, screenshots and browser trace captured. Review and approve the result to start PR review.');
       } catch (error) { s.status = 'demo_failed'; s.error = error.message; this.event(s, 'Demo failed. Review the app URL, start command and steps, then retry.', 'error'); }
       const artifacts = [];
       async function walk(dir) {
