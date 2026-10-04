@@ -4,3 +4,20 @@ test-results/
 playwright-report/
 dist/
 *.vsix
+
+# Local credentials and generated harness data
+.env*
+.harness/
+
+# Runtime logs
+*.log
+
+# Private keys and certificate bundles
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
