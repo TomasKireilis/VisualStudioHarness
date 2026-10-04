@@ -23,13 +23,13 @@ try {
     let command = config.start.command;
     let args = config.start.args || [];
     // npm.cmd cannot be spawned directly on Windows without a shell.
-    if (command === 'npm') {
+    if (command === 'npm' && process.platform === 'win32') {
       const npm = process.env.npm_execpath || path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
       command = process.execPath;
       args = [npm, ...args];
     }
     if (typeof command !== 'string' || !Array.isArray(args) || args.some(x => typeof x !== 'string')) throw new Error('Invalid app start command');
-    app = spawn(command, args, { cwd: root, shell: false, windowsHide: true, stdio: ['ignore', log.fd, log.fd] });
+    app = spawn(command, args, { cwd: root, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', log.fd, log.fd] });
     let spawnError;
     app.on('error', error => { spawnError = error; });
     const deadline = Date.now() + 60000;
@@ -113,7 +113,11 @@ try {
         app.kill();
         result.cleanupWarning = 'Windows denied process-tree cleanup. The direct app process was stopped; check for child processes.';
       }
-    } else app.kill('SIGTERM');
+    } else {
+      try { process.kill(-app.pid, 'SIGKILL'); } catch (error) {
+        if (error.code !== 'ESRCH') result.cleanupWarning = `App process-tree cleanup failed: ${error.message}`;
+      }
+    }
     app.unref();
   }
   await log.close();

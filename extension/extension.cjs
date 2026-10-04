@@ -1,13 +1,14 @@
 const vscode = require('vscode');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { Buffer } = require('node:buffer');
 let active;
 
 function activate(context) {
   const output = vscode.window.createOutputChannel('AI Workbench');
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
   status.text = '$(hubot) AI Workbench'; status.command = 'aiWorkbench.openDashboard';
-  let busy = false, pending, folder, bridge, trustNoticeShown = false;
+  let busy = false, pending, folder, workspaceUri, bridge, trustNoticeShown = false;
   const reported = new Set();
   let failures = 0;
   let summaryModel, summaryBusy = false;
@@ -25,7 +26,11 @@ function activate(context) {
     output.appendLine(`Connecting: trusted=${vscode.workspace.isTrusted}, folders=${vscode.workspace.workspaceFolders?.length || 0}`);
     for (const root of vscode.workspace.workspaceFolders || []) {
       try {
-        const candidate = JSON.parse(await fs.readFile(path.join(root.uri.fsPath, '.harness/bridge.json'), 'utf8'));
+        const remote = root.uri.scheme === 'vscode-remote';
+        const contents = remote
+          ? await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root.uri, '.harness', 'bridge.json'))
+          : await fs.readFile(path.join(root.uri.fsPath, '.harness/bridge.json'));
+        const candidate = JSON.parse(Buffer.from(contents).toString('utf8'));
         if (!vscode.workspace.isTrusted) {
           bridge = undefined;
           status.text = '$(shield) Workbench: trust required'; status.show();
@@ -40,7 +45,21 @@ function activate(context) {
         }
         const address = new URL(candidate.serverUrl);
         if (address.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(address.hostname) || address.username || address.password || address.pathname !== '/') throw new Error('Bridge must target a local HTTP server');
-        bridge = candidate; folder = root.uri.fsPath; status.show();
+        if (candidate.executionBackend === 'docker-linux' && !remote) {
+          bridge = undefined;
+          status.text = '$(remote) Workbench: open container'; status.show();
+          output.appendLine('This workspace runs in Docker. Use Open VS Code in the dashboard to attach to its container before sending requests.');
+          return;
+        }
+        let localFolder = root.uri.fsPath;
+        if (remote) {
+          if (typeof candidate.hostFolder !== 'string' || !path.isAbsolute(candidate.hostFolder)) throw new Error('Remote workspace bridge is missing its host folder. Restart AI Workbench.');
+          // This UI extension stays on Windows and reads the shared bind mount.
+          const localBridge = JSON.parse(await fs.readFile(path.join(candidate.hostFolder, '.harness/bridge.json'), 'utf8'));
+          if (localBridge.sessionId !== candidate.sessionId || localBridge.token !== candidate.token || localBridge.serverUrl !== candidate.serverUrl) throw new Error('Container bridge does not match the host workspace.');
+          localFolder = candidate.hostFolder;
+        }
+        bridge = candidate; folder = localFolder; workspaceUri = root.uri; status.show();
         output.appendLine(`Connected workspace ${candidate.sessionId}`);
         return;
       } catch (error) { if (error.code !== 'ENOENT') output.appendLine(error.message); }
@@ -50,6 +69,10 @@ function activate(context) {
     await fs.writeFile(path.join(folder, '.harness/pending-prompt.md'), job.prompt);
     const commands = await vscode.commands.getCommands(true);
     if (!commands.includes('workbench.action.chat.open') || !commands.includes('workbench.action.chat.newLocalChat')) throw new Error('Local Copilot chat commands are unavailable. Use VS Code 1.109 or newer, enable GitHub Copilot chat and sign in.');
+    // Set the default before creating the chat; keep it within this workspace.
+    const chat = vscode.workspace.getConfiguration('chat', workspaceUri);
+    await chat.update('permissions.default', job.autoApprove ? 'autoApprove' : 'default', vscode.ConfigurationTarget.Workspace);
+    output.appendLine(`New chat tool approvals: ${job.autoApprove ? 'automatic' : 'manual'} (server setting)`);
     await vscode.commands.executeCommand('workbench.action.chat.newLocalChat');
     await vscode.commands.executeCommand('workbench.action.chat.open', { query: job.prompt, mode: 'agent', isPartialQuery: !auto });
     output.appendLine(`${auto ? 'Submitted' : 'Prepared (press Send in chat)'} job ${job.id}`);

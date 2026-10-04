@@ -35,7 +35,28 @@ export async function npmCli() {
   return found;
 }
 
-export async function prepareCodeArgs(folder, extensionPath) {
+export async function openDashboard(url) {
+  const address = new URL(url);
+  if (address.protocol !== 'http:' || address.hostname !== '127.0.0.1') throw new Error('Dashboard must use local HTTP');
+  if (process.platform === 'win32') await run('rundll32.exe', ['url.dll,FileProtocolHandler', url], { timeout: 15000 });
+}
+
+export async function startDockerDesktop() {
+  const { existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const executable = process.env.AIWORK_DOCKER_DESKTOP_EXE || [
+    join(process.env.ProgramFiles || 'C:/Program Files', 'Docker/Docker/Docker Desktop.exe'),
+    join(process.env.LOCALAPPDATA || '', 'Docker/Docker Desktop.exe')
+  ].find(file => existsSync(file));
+  if (!executable) throw new Error('Docker Desktop executable not found. Set AIWORK_DOCKER_DESKTOP_EXE to Docker Desktop.exe.');
+  await new Promise((resolve, reject) => {
+    const child = spawn(executable, [], { detached: true, windowsHide: true, stdio: 'ignore' });
+    child.once('error', reject);
+    child.once('spawn', () => { child.unref(); resolve(); });
+  });
+}
+
+export async function prepareCodeArgs(folder, extensionPath, execution) {
   const { cp } = await import('node:fs/promises');
   const { join, resolve } = await import('node:path');
   const workspace = resolve(folder);
@@ -43,14 +64,19 @@ export async function prepareCodeArgs(folder, extensionPath) {
   if (extensionPath) {
     // VS Code reloads an existing development host for the same extension path,
     // even with --new-window. A workspace-specific copy gives each its own host.
-    const bridgePath = join(workspace, '.harness', 'bridge-extension');
+    const bridgePath = join(workspace, '.harness', execution?.backend === 'docker-linux' ? 'bridge-extension-remote' : 'bridge-extension');
     await cp(extensionPath, bridgePath, { recursive: true, force: true });
     args.push(`--extensionDevelopmentPath=${bridgePath}`);
+  }
+  if (execution?.backend === 'docker-linux') {
+    const authority = `attached-container+${Buffer.from(JSON.stringify({ containerName: `/${execution.name}` })).toString('hex')}`;
+    // Development hosts discard folders whose authority differs from the launch authority.
+    return [...args, '--extensionDevelopmentKind=ui', '--remote', authority, '--folder-uri', `vscode-remote://${authority}${execution.workspacePath}`];
   }
   return [...args, workspace];
 }
 
-export async function openCode(folder, extensionPath) {
+export async function openCode(folder, extensionPath, execution) {
   const { existsSync } = await import('node:fs');
   const { readFile } = await import('node:fs/promises');
   const { join, dirname, resolve } = await import('node:path');
@@ -72,5 +98,11 @@ export async function openCode(folder, extensionPath) {
   // A server started from an extension host inherits its entry point and IPC
   // settings. The desktop launcher must start with its own environment.
   for (const key of Object.keys(env)) if (key.startsWith('VSCODE_')) delete env[key];
-  await run(executable, [cli, ...await prepareCodeArgs(folder, extensionPath)], { timeout: 30000, env });
+  if (execution?.backend === 'docker-linux') {
+    const installed = await run(executable, [cli, '--list-extensions'], { timeout: 30000, env });
+    if (!installed.split(/\r?\n/).some(name => name.trim().toLowerCase() === 'ms-vscode-remote.remote-containers')) {
+      throw new Error('Install the VS Code Dev Containers extension (ms-vscode-remote.remote-containers), then use Open VS Code in the dashboard.');
+    }
+  }
+  await run(executable, [cli, ...await prepareCodeArgs(folder, extensionPath, execution)], { timeout: 30000, env });
 }

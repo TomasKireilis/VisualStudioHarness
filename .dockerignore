@@ -1,0 +1,7 @@
+*
+!docker/
+!docker/**
+!templates/
+!templates/demo/
+!templates/demo/**
+templates/demo/node_modules/

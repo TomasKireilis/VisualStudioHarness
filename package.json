@@ -7,9 +7,11 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test test/*.test.js",
+    "test:docker": "node test/docker.integration.mjs",
     "test:ui": "playwright test",
     "setup": "playwright install chromium",
-    "extension:package": "node scripts/package-extension.js"
+    "extension:package": "node scripts/package-extension.js",
+    "bundle:package": "node scripts/package-workbench.js"
   },
   "devDependencies": { "@playwright/test": "1.58.2" }
 }

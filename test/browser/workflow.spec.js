@@ -19,6 +19,31 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => { await new Promise(resolve => app.server.close(resolve)); });
 
+test('restore workspace reopens VS Code and retains the pending phase and request', async ({ page }) => {
+  const workspace = await app.workbench.create();
+  await app.workbench.locks.get(workspace.id);
+  await app.workbench.brief(workspace.id, 'Recover this saved workspace');
+  const session = app.workbench.get(workspace.id);
+  const jobId = session.jobs[0].id;
+  const launch = app.workbench.launch;
+  const launched = [];
+  app.workbench.launch = async folder => { launched.push(folder); };
+  try {
+    await page.goto(app.url);
+    await page.locator(`.workspace[data-id="${workspace.id}"]`).click();
+    await page.getByRole('button', { name: 'Restore workspace' }).click();
+    await expect(page.locator('.restore-workspace')).toContainText('VS Code reopened');
+    expect(launched).toEqual([workspace.folder]);
+    expect(session.phase).toBe('requirements');
+    expect(session.jobs).toHaveLength(1);
+    expect(session.jobs[0].id).toBe(jobId);
+    expect(session.jobs[0].status).toBe('queued');
+  } finally {
+    await app.workbench.restorations.get(workspace.id);
+    app.workbench.launch = launch;
+  }
+});
+
 test('requirements separate business and technical information and approve below the editor', async ({ page }) => {
   const workspace = await app.workbench.create();
   await app.workbench.locks.get(workspace.id);

@@ -4,13 +4,13 @@ let reconnecting;
 let sessions = [], selected = localStorage.getItem('workbench.selected'), signature = '', busy = false;
 const viewedPhases = new Map();
 const phases = ['preparation', 'requirements', 'development', 'demo', 'pr_review', 'refactoring', 'handoff'];
-const working = s => ['setting_up', 'waiting_for_agent', 'agent_working', 'demo_pending', 'recording'].includes(s.status);
+const working = s => s.recovery?.status === 'restoring' || ['setting_up', 'waiting_for_agent', 'agent_working', 'demo_pending', 'recording'].includes(s.status);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 const labels = { setting_up: 'Preparing environment', awaiting_brief: 'Ready for your idea', waiting_for_agent: 'Waiting for VS Code', agent_working: 'With the AI', awaiting_human: 'Your input needed', requirements_ready: 'Ready for review', bridge_error: 'Bridge needs attention', error: 'Setup needs attention', demo_pending: 'Preparing demo', recording: 'Recording demo', demo_failed: 'Demo needs attention', handoff_pending: 'Ready for human PR', complete: 'Complete' };
 const guidance = { preparation: 'We verify the browser and recording tools before you start. Retry here if setup fails. Completed preparation is locked.', pr_review: 'AI checks feature coverage, readability, formatting, tests and onion architecture. Findings go to refactoring, then a fresh review.', refactoring: 'AI fixes review findings and cleans up the code. PR review runs again after each refactoring pass.', handoff: 'Reserved for Git push and human PR in a future update.', requirements: 'Describe the outcome you want. The AI will ask about anything that needs more detail. Review the requirements before development starts.', development: 'Follow AI progress in the activity history. If the AI needs a decision, its questions will appear here. Your approved requirements stay in the project folder.', demo: 'Review the result and the AI summary of changes and checks. Approve the result here to start PR review.' };
 function toast(message) { $('#toast').textContent = message; $('#toast').hidden = false; setTimeout(() => $('#toast').hidden = true, 9000); }
 async function api(url, data, method, retry = true) {
-  const response = await fetch(url, { method: method || (data === undefined ? 'GET' : 'POST'), headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': token }, body: data === undefined ? undefined : JSON.stringify(data), signal: AbortSignal.timeout(url.endsWith('/rollback') ? 200000 : 15000) });
+  const response = await fetch(url, { method: method || (data === undefined ? 'GET' : 'POST'), headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': token }, body: data === undefined ? undefined : JSON.stringify(data), signal: AbortSignal.timeout(/\/(rollback|open)$/.test(url) ? 200000 : 15000) });
   const result = await response.json();
   if (response.status === 401 && retry) {
     reconnecting ||= fetch('/', { cache: 'no-store', signal: AbortSignal.timeout(8000) }).then(async response => {
@@ -30,7 +30,7 @@ const current = () => sessions.find(s => s.id === selected);
 async function deleteWorkspace(id) {
   if (busy) return;
   const workspace = sessions.find(s => s.id === id);
-  if (!workspace || !confirm(`Permanently delete "${workspace.title}"?\n\n${workspace.folder}\n\nThis removes all project files, conversations, and recordings. This cannot be undone.`)) return;
+  if (!workspace || !confirm(`Permanently delete "${workspace.title}"?\n\n${workspace.folder}\n\nThis removes all project files, conversations, and recordings.${workspace.execution?.backend === 'docker-linux' ? ' Its Docker container and dependency volumes will also be removed.' : ''} This cannot be undone.`)) return;
   busy = true;
   try {
     await api(`/api/sessions/${id}`, { confirmId: id }, 'DELETE');
@@ -115,6 +115,7 @@ function render() {
   $('#workspace-count').textContent = sessions.length;
   $('#workspaces').innerHTML = sessions.map(item => `<div class="workspace-row ${item.id === selected ? 'active' : ''}"><button class="workspace ${item.id === selected ? 'active' : ''}" data-id="${item.id}" title="${esc(item.title)}">▱ &nbsp;${esc(item.title)}<small>${labels[item.status] || item.status}</small></button><button class="delete-workspace" data-delete="${item.id}" aria-label="Delete workspace ${esc(item.title)}" title="Delete workspace">×</button></div>`).join('');
   $('#open-code').disabled = !s;
+  $('#runtime-status').textContent = s ? (s.execution?.backend === 'docker-linux' ? 'Linux container' : 'Windows host') : 'Preparing';
   $('#auto-submit').disabled = !s;
   if (!s) {
     $('#current-activity').textContent = ''; $('#summaries').innerHTML = ''; $('#summary-status').textContent = ''; $('#rollback-controls').innerHTML = '';
@@ -158,13 +159,24 @@ function render() {
   $('#panel-title').textContent = viewedPhase === 'preparation' ? 'Prepare your environment' : viewedPhase === 'requirements' ? s.status === 'awaiting_brief' ? 'Start with your idea' : 'Shape the requirements' : viewedPhase === 'development' ? 'Building your solution' : ({ demo: 'The result, made visible', pr_review: 'Checking features and code quality', refactoring: 'Refactoring and cleaning up', handoff: 'Git push & human PR' })[viewedPhase];
   $('#activity').innerHTML = s.events.slice(-6).reverse().map(e => `<li>${esc(e.text)}<time>${new Date(e.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></li>`).join('');
   $('#updated').textContent = 'Connected to local server';
-  const nextSignature = JSON.stringify([s.id, s.phase, viewedPhase, s.status, s.questions, s.messages, s.requirements, s.error, s.artifacts, s.jobs.map(j => j.status)]);
+  const nextSignature = JSON.stringify([s.id, s.phase, viewedPhase, s.status, s.questions, s.messages, s.requirements, s.error, s.artifacts, s.recovery, s.connected, s.jobs.map(j => j.status)]);
   if (signature === nextSignature) return;
   signature = nextSignature;
   const returnPhase = phases.indexOf(viewedPhase) > 0 && phases.indexOf(viewedPhase) < phases.indexOf(s.phase) ? viewedPhase : phases[phases.indexOf(s.phase) - 1];
   $('#rollback-controls').innerHTML = viewedPhase !== 'preparation' && ['development', 'demo', 'pr_review', 'refactoring', 'handoff'].includes(s.phase) ? `<details><summary>Return to previous step</summary><form id="rollback-form"><p>Reopen ${returnPhase} with your feedback. Current files and review history are kept.${s.status === 'recording' ? ' The return will wait for recording to finish.' : ''}</p><label for="rollback-reason">Bug or question to resolve</label><textarea id="rollback-reason" required maxlength="100000"></textarea>${s.jobs.some(j => j.status === 'dispatched') ? '<label><input id="agent-stopped" type="checkbox" required> I stopped the active Copilot request in VS Code</label>' : ''}<button class="secondary">Return & continue</button></form></details>` : '';
   $('#rollback-form')?.addEventListener('submit', e => { e.preventDefault(); action('rollback', { phase: returnPhase, reason: $('#rollback-reason').value, stopped: $('#agent-stopped')?.checked || false }); });
   $('#workspace-content').innerHTML = content(s, viewedPhase);
+  if (s.recovery || !s.connected && s.demoReady) {
+    const recovery = document.createElement('div');
+    recovery.className = 'restore-workspace';
+    recovery.innerHTML = `<p role="status">${esc(s.recovery?.message || 'Workspace disconnected. Restore it to reopen VS Code and reconnect the environment.')}</p><button class="secondary" id="restore-workspace" ${s.recovery?.status === 'restoring' ? 'disabled' : ''}>${s.recovery?.status === 'restoring' ? 'Restoring workspace…' : 'Restore workspace ↗'}</button>`;
+    $('#workspace-content').prepend(recovery);
+    $('#restore-workspace').addEventListener('click', () => {
+      const retry = s.jobs.some(job => job.status === 'dispatched');
+      if (retry && !s.interruptedByShutdown && !confirm('The previous Copilot request might still be running. Stop it in VS Code first, or confirm that the PC shut down and it ended. Restore the workspace and start a new attempt?')) return;
+      action('restore', { retry, stopped: retry });
+    });
+  }
 
   $('#brief-form')?.addEventListener('submit', e => { e.preventDefault(); action('brief', { text: $('#brief').value }); });
   $('#question-form')?.addEventListener('submit', e => {

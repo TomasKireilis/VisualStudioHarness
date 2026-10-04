@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Workbench } from './workbench.js';
 import { inside } from './files.js';
-import { openCode } from './process.js';
+import { openDashboard } from './process.js';
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.json': 'application/json', '.md': 'text/plain', '.log': 'text/plain', '.webm': 'video/webm', '.png': 'image/png', '.zip': 'application/zip' };
@@ -20,7 +20,8 @@ function textField(value, name = 'text') {
   if (typeof value !== 'string' || !value.trim() || value.length > 100000) throw new Error(`${name} is required (maximum 100,000 characters)`);
   return value.trim();
 }
-export async function startServer({ port = 4310, root = 'C:/AIWork', autoOpen = true, createOnStart = true, provision, launch } = {}) {
+export async function startServer({ port = 4310, root = 'C:/AIWork', autoOpen = true, autoApprove = true, createOnStart, provision, launch, backend = provision ? 'host' : 'docker-linux', docker } = {}) {
+  if (!['host', 'docker-linux'].includes(backend)) throw new Error('AIWORK_EXECUTION must be docker-linux or host');
   const uiToken = crypto.randomBytes(32).toString('hex');
   let workbench;
   const server = http.createServer(async (req, res) => {
@@ -90,14 +91,17 @@ export async function startServer({ port = 4310, root = 'C:/AIWork', autoOpen = 
           case 'brief': return send(res, 200, await workbench.brief(id, textField(input.text)));
           case 'answer': return send(res, 200, await workbench.answer(id, textField(input.text)));
           case 'approve': return send(res, 200, await workbench.approve(id, textField(input.requirements, 'requirements')));
-          case 'retry-job': return send(res, 200, await workbench.retryJob(id));
+          case 'retry-job': return send(res, 200, await workbench.retryJob(id, { reopen: true }));
+          case 'restore':
+            void workbench.restore(id, { retry: input.retry === true, stopped: input.stopped === true }).catch(() => {});
+            return send(res, 202, { ok: true });
           case 'setup':
             if (s.demoReady || s.status !== 'error') throw new Error('Setup is not eligible for retry');
             workbench.setup(id).catch(() => {}); return send(res, 202, { ok: true });
           case 'demo':
             if (!['demo_failed', 'complete'].includes(s.status) || !s.uiChanged) throw new Error('Demo is not eligible for retry');
             workbench.demo(id).catch(() => {}); return send(res, 202, { ok: true });
-          case 'open': await openCode(s.folder, path.join(project, 'extension')); return send(res, 200, { ok: true });
+          case 'open': await workbench.open(id); return send(res, 200, { ok: true });
           default: return send(res, 404, { error: 'Unknown action' });
         }
       }
@@ -114,9 +118,10 @@ export async function startServer({ port = 4310, root = 'C:/AIWork', autoOpen = 
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   const url = `http://127.0.0.1:${server.address().port}`;
-  workbench = new Workbench({ root, url, autoOpen, provision, launch });
-  try { await workbench.load(); if (createOnStart) await workbench.create(); }
+  workbench = new Workbench({ root, url, autoOpen, autoApprove, provision, launch, backend, docker });
+  try { await workbench.load(); if (createOnStart === true || createOnStart === undefined && !workbench.sessions.size) await workbench.create(); }
   catch (error) { server.close(); throw error; }
+  const restoration = workbench.resume();
   let summarizing = false;
   const summaryTimer = setInterval(async () => {
     if (summarizing) return;
@@ -127,11 +132,14 @@ export async function startServer({ port = 4310, root = 'C:/AIWork', autoOpen = 
   }, 1000);
   summaryTimer.unref();
   server.once('close', () => clearInterval(summaryTimer));
-  return { server, workbench, url, uiToken };
+  return { server, workbench, url, uiToken, restoration };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  startServer({ port: Number(process.env.PORT || 4310), root: process.env.AIWORK_ROOT || 'C:/AIWork', autoOpen: process.env.AIWORK_OPEN_CODE !== 'false', createOnStart: process.env.AIWORK_CREATE_ON_START !== 'false' })
-    .then(({ url }) => console.log(`AI Workbench is running at ${url}\nOpen this address to guide your project.`))
+  startServer({ port: Number(process.env.PORT || 4310), root: process.env.AIWORK_ROOT || 'C:/AIWork', autoOpen: process.env.AIWORK_OPEN_CODE !== 'false', autoApprove: process.env.AIWORK_AUTO_APPROVE !== 'false', createOnStart: process.env.AIWORK_CREATE_ON_START === undefined ? undefined : process.env.AIWORK_CREATE_ON_START !== 'false', backend: process.env.AIWORK_EXECUTION || 'docker-linux' })
+    .then(async ({ url }) => {
+      console.log(`AI Workbench is running at ${url}\nOpen this address to guide your project.`);
+      if (process.env.AIWORK_OPEN_BROWSER === 'true') await openDashboard(url).catch(error => console.error(`Open the dashboard manually: ${error.message}`));
+    })
     .catch(error => { console.error(error.message); process.exitCode = 1; });
 }

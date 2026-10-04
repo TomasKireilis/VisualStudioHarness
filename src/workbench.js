@@ -8,16 +8,23 @@ import { run, npmCli, openCode } from './process.js';
 import { ActivityService } from './activity.js';
 import { makePrompt } from './prompts.js';
 import { phases, validateReview, validateRefactoring } from './workflow.js';
+import { DockerRuntime, containerCache } from './docker.js';
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const now = () => new Date().toISOString();
 export class Workbench {
-  constructor({ root, url, autoOpen = true, provision, launch = openCode }) {
+  constructor({ root, url, autoOpen = true, autoApprove = true, provision, launch, backend = provision ? 'host' : 'docker-linux', docker = new DockerRuntime(), hostBootTime = Date.now() - os.uptime() * 1000 }) {
+    if (!['host', 'docker-linux'].includes(backend)) throw new Error('AIWORK_EXECUTION must be docker-linux or host');
     this.root = path.resolve(root);
     this.url = url;
     this.autoOpen = autoOpen;
+    this.autoApprove = autoApprove;
+    this.backend = backend;
+    this.docker = docker;
+    this.hostBootTime = hostBootTime;
+    this.restorations = new Map();
     this.provision = provision || this.installDemo.bind(this);
-    this.launch = launch;
+    this.launch = launch || ((folder, extensionPath, session) => openCode(folder, extensionPath, session?.execution));
     this.sessions = new Map();
     this.locks = new Map();
     this.saves = new Map();
@@ -37,7 +44,7 @@ export class Workbench {
   async remove(id, confirmation) {
     const check = session => {
       if (confirmation !== session.id) throw new Error('Workspace deletion requires its exact ID');
-      if (this.locks.has(id) || ['setting_up', 'recording', 'demo_pending', 'agent_working'].includes(session.status) || session.jobs.some(j => j.status === 'dispatched')) {
+      if (this.restorations.has(id) || this.locks.has(id) || ['setting_up', 'recording', 'demo_pending', 'agent_working'].includes(session.status) || session.jobs.some(j => j.status === 'dispatched')) {
         throw Object.assign(new Error('This workspace has active work. Finish the running request before deleting it.'), { status: 409 });
       }
     };
@@ -54,6 +61,7 @@ export class Workbench {
       try {
         await this.saves.get(id);
         await this.activity.writes.get(id);
+        if (session.execution?.backend === 'docker-linux') await this.docker.remove(session);
         await fs.rm(target, { recursive: true, maxRetries: 2, retryDelay: 200 });
       } catch (error) { this.activity.removing.delete(id); throw error; }
       this.activity.writes.delete(id);
@@ -92,20 +100,27 @@ export class Workbench {
         session.folder = path.join(this.root, entry.name);
         session.lastHeartbeat = null;
         if (!session.demoReady && !session.brief && ['setting_up', 'error'].includes(session.status)) session.phase = 'preparation';
-        if (['setting_up', 'recording'].includes(session.status)) {
-          session.status = 'error'; session.error = 'Server stopped during an operation. Retry setup or demo.';
+        if (session.status === 'setting_up') {
+          session.interruptedOperation = 'setup'; session.status = 'error'; session.error = 'Setup was interrupted. Restore the workspace to continue.';
+        } else if (session.status === 'recording') {
+          session.interruptedOperation = 'demo'; session.status = 'demo_failed'; session.error = 'Recording was interrupted. Restore the workspace to record again.';
         }
+        const dispatched = session.jobs.find(job => job.status === 'dispatched');
+        session.interruptedByShutdown = Boolean(dispatched?.hostBootTime && Math.abs(dispatched.hostBootTime - this.hostBootTime) > 10000);
+        session.recovery = null;
         await this.activity.load(session);
         if (session.status !== 'agent_working') this.activity.stop(session);
         this.sessions.set(session.id, session);
         await this.configureBrowser(session);
+        await this.configureChat(session);
+        if (session.execution?.backend === 'docker-linux') await this.docker.configure(session);
         await this.bridge(session);
-        await this.activity.save(session);
+        await this.save(session);
       } catch { /* Ignore unrelated or incomplete directories. */ }
     }
   }
   async bridge(session) {
-    await json(path.join(session.folder, '.harness/bridge.json'), { serverUrl: this.url, sessionId: session.id, token: session.token });
+    await json(path.join(session.folder, '.harness/bridge.json'), { serverUrl: this.url, sessionId: session.id, token: session.token, hostFolder: session.folder, executionBackend: session.execution?.backend || 'host' });
   }
   async create() {
     const id = `work-${new Date().toISOString().slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`;
@@ -115,14 +130,20 @@ export class Workbench {
     await fs.writeFile(path.join(folder, '.harness/setup.log'), 'Workspace created. Setup is starting.\n');
     await fs.mkdir(path.join(folder, 'artifacts'), { recursive: true });
     await fs.cp(path.join(project, 'templates/demo'), path.join(folder, '.harness/demo'), { recursive: true });
-    await this.configureBrowser({ folder });
     await fs.mkdir(path.join(folder, '.github'), { recursive: true });
     await fs.writeFile(path.join(folder, '.github/copilot-instructions.md'), 'This workspace is managed by AI Workbench. Follow the current harness prompt and REQUIREMENTS.md. Return structured replies in the specified .harness/responses/<jobId>.json file. Demo tooling is preinstalled in .harness/demo. Never use Copilot CLI. Keep company tool and workspace trust settings intact.\n');
     await fs.writeFile(path.join(folder, '.gitignore'), 'node_modules/\n.harness/\nartifacts/\n.env*\n');
     await fs.writeFile(path.join(folder, 'REQUIREMENTS.md'), '# Requirements\n\nWaiting for the project brief.\n');
-    const session = { id, folder, token: crypto.randomBytes(32).toString('hex'), title: 'Untitled workspace', createdAt: now(), phase: 'preparation', status: 'setting_up', autoSubmit: true, brief: '', requirements: '', messages: [], jobs: [], events: [], artifacts: [], demoReady: false, error: null, lastHeartbeat: null };
+    const session = { id, folder, token: crypto.randomBytes(32).toString('hex'), title: 'Untitled workspace', createdAt: now(), phase: 'preparation', status: 'setting_up', autoSubmit: true, autoApprove: this.autoApprove, brief: '', requirements: '', messages: [], jobs: [], events: [], artifacts: [], demoReady: false, error: null, lastHeartbeat: null };
+    session.execution = this.backend === 'docker-linux' ? this.docker.spec(session) : { backend: 'host' };
+    await this.configureBrowser(session);
+    await this.configureChat(session);
+    if (session.execution.backend === 'docker-linux') {
+      await this.docker.configure(session);
+      await fs.appendFile(path.join(folder, '.github/copilot-instructions.md'), 'All dependencies, commands, builds, tests and demos run in the Linux workspace container at /workspace. Use the attached Dev Container terminal. Never execute generated code on the Windows host.\n');
+    }
     this.sessions.set(id, session);
-    this.event(session, 'Workspace created. Preparing Playwright and Chromium.');
+    this.event(session, session.execution.backend === 'docker-linux' ? 'Workspace created. Preparing a local Linux Docker container, Playwright and Chromium.' : 'Workspace created. Preparing Playwright and Chromium.');
     await this.bridge(session);
     await this.save(session);
     this.setup(id).catch(() => {});
@@ -140,11 +161,20 @@ export class Workbench {
         session.demoReady = true; session.preparedAt = now(); session.phase = 'requirements'; session.status = 'awaiting_brief';
         this.event(session, 'Playwright and Chromium are ready. Add your project brief.');
         if (this.autoOpen) {
-          try { await this.launch(session.folder, path.join(project, 'extension')); this.event(session, 'Requested a VS Code window. Waiting for the workspace bridge to connect.'); }
+          try { await this.launch(session.folder, path.join(project, 'extension'), session); session.openedAt = now(); this.event(session, 'Requested a VS Code window. Waiting for the workspace bridge to connect.'); }
           catch (error) { this.event(session, error.message, 'warning'); }
         }
       } catch (error) { session.status = 'error'; session.error = error.message; this.event(session, 'Environment setup failed. See the setup log and retry.', 'error'); }
       await this.save(session);
+    });
+  }
+  async configureChat(session) {
+    const dir = path.join(session.folder, '.harness/chat');
+    await fs.mkdir(dir, { recursive: true });
+    await fs.copyFile(path.join(project, 'templates/chat/question-hook.cjs'), path.join(dir, 'question-hook.cjs'));
+    const command = { type: 'command', command: 'node .harness/chat/question-hook.cjs', cwd: '.', timeout: 10 };
+    await json(path.join(session.folder, '.github/hooks/ai-workbench.json'), {
+      hooks: { UserPromptSubmit: [command], PreToolUse: [command], Stop: [command] }
     });
   }
   async configureBrowser(session) {
@@ -152,7 +182,10 @@ export class Workbench {
     let runtime;
     try { runtime = await readJson(path.join(dir, 'runtime.json')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (!runtime) {
+    if (session.execution?.backend === 'docker-linux') {
+      runtime = { browsersPath: containerCache, backend: 'docker-linux' };
+      await json(path.join(dir, 'runtime.json'), runtime);
+    } else if (!runtime) {
       const defaultCache = process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData/Local'), 'ms-playwright')
         : process.platform === 'darwin' ? path.join(os.homedir(), 'Library/Caches/ms-playwright')
         : path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'ms-playwright');
@@ -165,7 +198,7 @@ export class Workbench {
     let settings;
     try { settings = await readJson(settingsFile); }
     catch (error) { if (error.code === 'ENOENT') settings = {}; else return runtime; } // Preserve user-authored JSONC.
-    for (const platform of ['windows', 'linux', 'osx']) {
+    for (const platform of session.execution?.backend === 'docker-linux' ? ['linux'] : ['windows', 'linux', 'osx']) {
       const key = `terminal.integrated.env.${platform}`;
       settings[key] = { ...settings[key], PLAYWRIGHT_BROWSERS_PATH: runtime.browsersPath };
     }
@@ -187,6 +220,12 @@ export class Workbench {
       writes.catch(() => {});
     };
     try {
+      if (session.execution?.backend === 'docker-linux') {
+        onOutput('Preparing this workspace in a local Linux Docker container.\n');
+        await this.docker.startDesktop();
+        await this.docker.provision(session, onOutput);
+        return;
+      }
       const expected = (await readJson(path.join(cwd, 'package.json'))).devDependencies['@playwright/test'];
       const packages = ['@playwright/test', 'playwright', 'playwright-core'];
       const available = await Promise.all(packages.map(async name => {
@@ -220,8 +259,8 @@ export class Workbench {
       throw error;
     } finally { await writes; }
   }
-  async queue(session, kind) {
-    const job = { id: crypto.randomUUID(), kind, status: 'queued', createdAt: now() };
+  async queue(session, kind, resumeFrom) {
+    const job = { id: crypto.randomUUID(), kind, status: 'queued', createdAt: now(), ...(resumeFrom ? { resumeFrom } : {}) };
     job.prompt = makePrompt(session, job);
     session.jobs.push(job);
     this.activity.record(session, 'prompt', job.prompt);
@@ -273,17 +312,26 @@ export class Workbench {
     return this.exclusive(id, async () => {
       const s = this.get(id);
       s.lastHeartbeat = now();
+      if (s.recovery?.status === 'restoring') return null;
+      if (s.recovery?.status === 'waiting_bridge') {
+        s.recovery = null;
+        this.event(s, 'VS Code bridge reconnected. Workspace restored.');
+        await this.save(s);
+      }
       const active = s.jobs.find(j => j.status === 'dispatched');
       if (active) return null; // Never automatically resend a possibly submitted prompt.
       const job = s.jobs.find(j => j.status === 'queued');
       if (!job) return null;
+      await this.ensureContainer(s);
       job.status = 'dispatched'; job.dispatchedAt = now();
+      job.hostBootTime = this.hostBootTime;
+      s.interruptedByShutdown = false;
       s.status = 'agent_working';
       this.activity.start(s, job.id);
       this.activity.record(s, 'input', job.prompt);
       this.event(s, 'Prompt handed to the VS Code extension. Waiting for a structured reply.');
       await this.save(s);
-      return { ...job, autoSubmit: s.autoSubmit !== false };
+      return { ...job, autoSubmit: s.autoSubmit !== false, autoApprove: s.autoApprove === true };
     });
   }
   async setAutoSubmit(id, value) {
@@ -304,16 +352,19 @@ export class Workbench {
       await this.save(s);
     });
   }
-  async retryJob(id) {
-    return this.exclusive(id, async () => {
+  async retryJob(id, { reopen = this.autoOpen } = {}) {
+    const result = await this.exclusive(id, async () => {
       const s = this.get(id), job = s.jobs.find(j => j.status === 'dispatched');
       if (!job) throw new Error('No dispatched job to retry');
       job.status = 'cancelled';
       this.activity.stop(s);
       this.event(s, 'Human requested a new attempt. Replies to the old job will be ignored.');
-      await this.queue(s, job.kind);
+      s.interruptedByShutdown = false;
+      await this.queue(s, job.kind, job.id);
       return this.public(s);
     });
+    if (reopen) void this.restore(id).catch(() => {});
+    return result;
   }
   async response(id, reply) {
     return this.exclusive(id, async () => {
@@ -381,11 +432,11 @@ export class Workbench {
         await fs.writeFile(path.join(s.folder, 'REQUIREMENTS.md'), reply.requirements);
         this.event(s, 'Requirements are ready to review and approve.');
       }
-      job.status = 'complete'; job.completedAt = now(); s.error = null;
+      job.status = 'complete'; job.completedAt = now(); s.error = null; s.interruptedByShutdown = false;
       s.messages.push({ role: 'ai', phase: job.kind === 'demo_review' ? 'demo' : job.kind, text: reply.message || (reply.kind === 'requirements_ready' ? 'Requirements are ready for review.' : 'Work completed.'), questions: reply.questions || [], time: now() });
       if (nextJob) await this.queue(s, nextJob);
       else await this.save(s);
-      if (s.status === 'demo_pending') setImmediate(() => this.demo(id).catch(() => {}));
+      if (s.status === 'demo_pending' && !this.restorations.has(id)) setImmediate(() => this.demo(id).catch(() => {}));
       return this.public(s);
     });
   }
@@ -464,7 +515,13 @@ export class Workbench {
       await this.save(s);
       try {
         const runtime = await this.configureBrowser(s);
-        await run(process.execPath, [path.join(s.folder, '.harness/demo/record.mjs')], { cwd: s.folder, env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: runtime.browsersPath }, timeout: 180000, onOutput: text => this.activity.record(s, 'tool', text) });
+        const onOutput = text => this.activity.record(s, 'tool', text);
+        if (s.execution?.backend === 'docker-linux') {
+          await this.ensureContainer(s);
+          await this.docker.exec(s, 'node', ['.harness/demo/record.mjs'], { timeout: 180000, onOutput });
+        } else {
+          await run(process.execPath, [path.join(s.folder, '.harness/demo/record.mjs')], { cwd: s.folder, env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: runtime.browsersPath }, timeout: 180000, onOutput });
+        }
         s.status = 'complete'; s.resultApprovedAt = null; this.event(s, 'Video, screenshots and browser trace captured. Review and approve the result to start PR review.');
       } catch (error) { s.status = 'demo_failed'; s.error = error.message; this.event(s, 'Demo failed. Review the app URL, start command and steps, then retry.', 'error'); }
       const artifacts = [];
@@ -480,6 +537,111 @@ export class Workbench {
       await this.save(s);
       return this.public(s);
     });
+  }
+  async ensureContainer(session) {
+    if (session.execution?.backend !== 'docker-linux') return;
+    try {
+      const state = await this.docker.ensure(session);
+      // Recreated containers need their demo dependencies restored too.
+      await this.docker.exec(session, 'node', ['/opt/aiwork/prepare.mjs'], { timeout: 120000 });
+      if (state?.created && session.demoReady) {
+        try {
+          await fs.access(path.join(session.folder, 'package.json'));
+          let command = 'install';
+          try { await fs.access(path.join(session.folder, 'package-lock.json')); command = 'ci'; } catch {}
+          this.event(session, 'Restoring project dependencies in the recreated container.');
+          await this.docker.exec(session, 'npm', [command, '--no-audit', '--no-fund'], { timeout: 120000 });
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+      if (session.containerError) { session.containerError = null; session.error = null; await this.save(session); }
+    } catch (error) {
+      session.containerError = error.message; session.error = `Workspace container unavailable: ${error.message}`;
+      await this.save(session);
+      throw error;
+    }
+  }
+  async open(id) {
+    return this.exclusive(id, async () => {
+      const session = this.get(id);
+      await this.ensureContainer(session);
+      await this.launch(session.folder, path.join(project, 'extension'), session);
+      session.openedAt = now();
+      await this.save(session);
+    });
+  }
+  async resume() {
+    if (!this.autoOpen) return;
+    await Promise.allSettled([...this.sessions.values()].filter(s => s.openedAt || s.interruptedOperation ||
+      s.jobs.some(job => ['queued', 'dispatched'].includes(job.status)) || s.status === 'demo_pending')
+      .map(s => this.restore(s.id)));
+  }
+  restore(id, { retry = false, stopped = false } = {}) {
+    if (this.restorations.has(id)) return this.restorations.get(id);
+    const restoring = this.restoreWorkspace(id, { retry, stopped }).finally(() => this.restorations.delete(id));
+    this.restorations.set(id, restoring);
+    return restoring;
+  }
+  async restoreWorkspace(id, { retry, stopped }) {
+    const s = this.get(id);
+    let launchedBySetup = false;
+    try {
+      await this.exclusive(id, async () => {
+        s.recovery = { status: 'restoring', message: 'Restoring the workspace environment…' };
+        this.event(s, 'Restoring the saved workspace, container and VS Code bridge.');
+        await this.save(s);
+      });
+      // A completed reply might have been written just before power was lost.
+      const active = s.jobs.find(job => job.status === 'dispatched');
+      if (active) {
+        try {
+          const reply = await readJson(path.join(s.folder, '.harness/responses', `${active.id}.json`));
+          await this.response(id, reply);
+        } catch (error) {
+          if (error.code !== 'ENOENT') this.event(s, `Saved reply could not be recovered: ${error.message}`, 'warning');
+        }
+      }
+      const pending = s.jobs.find(job => job.status === 'dispatched');
+      if (pending && (s.interruptedByShutdown || retry)) {
+        if (!s.interruptedByShutdown && !stopped) throw new Error('Stop the previous Copilot request before restarting it. Then retry the interrupted request.');
+        await this.retryJob(id, { reopen: false });
+      }
+      if (s.execution?.backend === 'docker-linux') await this.docker.startDesktop();
+      if (!s.demoReady && s.phase === 'preparation') {
+        const before = s.openedAt;
+        await this.setup(id);
+        if (!s.demoReady) throw new Error(s.error || 'Environment setup failed');
+        launchedBySetup = s.openedAt !== before;
+        s.interruptedOperation = null;
+      }
+      await this.exclusive(id, async () => {
+        await this.configureBrowser(s);
+        await this.configureChat(s);
+        await this.bridge(s);
+        if (s.execution?.backend === 'docker-linux') await this.docker.configure(s);
+        await this.ensureContainer(s);
+        if (!this.public(s).connected) {
+          if (!launchedBySetup) {
+            await this.launch(s.folder, path.join(project, 'extension'), s);
+            s.openedAt = now();
+          }
+          s.recovery = { status: 'waiting_bridge', message: 'VS Code reopened. Waiting for its workspace bridge to connect.' };
+        } else s.recovery = null;
+        s.error = null;
+        this.event(s, s.jobs.some(job => job.status === 'dispatched') ? 'Environment restored. The previous request is retained; retry it after stopping the old chat if it cannot continue.' : 'Environment restored. VS Code will pick up the saved request.');
+        await this.save(s);
+      });
+      if (s.interruptedOperation === 'demo' || s.status === 'demo_pending') {
+        s.interruptedOperation = null;
+        if (s.status === 'demo_failed') s.status = 'demo_pending';
+        await this.demo(id);
+      }
+      return this.public(s);
+    } catch (error) {
+      s.recovery = { status: 'failed', message: error.message };
+      this.event(s, `Workspace restore failed: ${error.message}`, 'error');
+      await this.save(s);
+      throw error;
+    }
   }
 }
 
